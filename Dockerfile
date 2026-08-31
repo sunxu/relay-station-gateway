@@ -8,7 +8,7 @@
 # =============================================================================
 
 ARG NODE_IMAGE=node:24-alpine
-ARG GOLANG_IMAGE=golang:1.26.6-alpine
+ARG GOLANG_IMAGE=golang:1.27.0-alpine
 ARG ALPINE_IMAGE=alpine:3.21
 ARG POSTGRES_IMAGE=postgres:18-alpine
 ARG GOPROXY=https://goproxy.cn,direct
@@ -31,6 +31,7 @@ RUN corepack enable && corepack prepare pnpm@9 --activate
 # Install dependencies first (better caching)
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN --mount=type=cache,id=sub2api-pnpm-store,target=/root/.local/share/pnpm/store \
+    --mount=type=tmpfs,target=/tmp,size=2147483648 \
     if [ -n "${NPM_CONFIG_REGISTRY}" ]; then pnpm config set registry "${NPM_CONFIG_REGISTRY}"; fi && \
     pnpm install --frozen-lockfile --prefer-offline
 
@@ -41,7 +42,7 @@ RUN --mount=type=cache,id=sub2api-pnpm-store,target=/root/.local/share/pnpm/stor
 # Copy only that subtree to keep the build dependency minimal.
 COPY frontend/ ./
 COPY docs/legal/ /app/docs/legal/
-RUN pnpm run build
+RUN --mount=type=tmpfs,target=/tmp,size=2147483648 pnpm run build
 
 # -----------------------------------------------------------------------------
 # Stage 2: Backend Builder
@@ -75,6 +76,7 @@ COPY backend/go.mod backend/go.sum ./
 # Cache mount keeps the module cache across builds so a transient CDN blip on
 # retry resumes instead of re-fetching every zip from scratch.
 RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
+    --mount=type=tmpfs,target=/tmp,size=4294967296 \
     go mod download
 
 # Copy backend source first
@@ -87,6 +89,7 @@ COPY --from=frontend-builder /app/backend/internal/web/dist ./internal/web/dist
 # Version precedence: build arg VERSION > exact git tag > cmd/server/VERSION
 RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
     --mount=type=cache,id=sub2api-gobuild,target=/root/.cache/go-build \
+    --mount=type=tmpfs,target=/tmp,size=4294967296 \
     VERSION_VALUE="${VERSION}" && \
     if [ -z "${VERSION_VALUE}" ]; then VERSION_VALUE="$(./scripts/resolve-version.sh)"; fi && \
     DATE_VALUE="${DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \

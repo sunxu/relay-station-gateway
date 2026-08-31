@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # =============================================================================
 # Sub2API Multi-Stage Dockerfile
 # =============================================================================
@@ -7,7 +9,7 @@
 # =============================================================================
 
 ARG NODE_IMAGE=node:24-alpine
-ARG GOLANG_IMAGE=golang:1.26.6-alpine
+ARG GOLANG_IMAGE=golang:1.27.0-alpine
 ARG ALPINE_IMAGE=alpine:3.20
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.google.cn
@@ -18,7 +20,7 @@ ARG GOSUMDB=sum.golang.google.cn
 FROM ${NODE_IMAGE} AS frontend-builder
 
 WORKDIR /app/frontend
-ENV NODE_OPTIONS=--max-old-space-size=1536
+ENV NODE_OPTIONS=--max-old-space-size=2048
 
 # Install pnpm. Keep this pinned to the lockfile-compatible major version so
 # Docker builds remain reproducible when pnpm changes config validation rules.
@@ -26,7 +28,9 @@ RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
 # Install dependencies first (better caching)
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=sub2api-pnpm-store,target=/root/.local/share/pnpm/store \
+    --mount=type=tmpfs,target=/tmp,size=2147483648 \
+    pnpm install --frozen-lockfile --prefer-offline
 
 # Copy frontend source and build.
 # LegalDocumentView.vue (admin-compliance gate) build-time imports
@@ -35,7 +39,7 @@ RUN pnpm install --frozen-lockfile
 # Copy only that subtree to keep the build dependency minimal.
 COPY frontend/ ./
 COPY docs/legal/ /app/docs/legal/
-RUN pnpm run build
+RUN --mount=type=tmpfs,target=/tmp,size=2147483648 pnpm run build
 
 # -----------------------------------------------------------------------------
 # Stage 2: Backend Builder
@@ -59,7 +63,9 @@ WORKDIR /app/backend
 
 # Copy go mod files first (better caching)
 COPY backend/go.mod backend/go.sum ./
-RUN go mod download
+RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
+    --mount=type=tmpfs,target=/tmp,size=4294967296 \
+    go mod download
 
 # Copy backend source first
 COPY backend/ ./
@@ -69,7 +75,10 @@ COPY --from=frontend-builder /app/backend/internal/web/dist ./internal/web/dist
 
 # Build the binary (BuildType=release for CI builds, embed frontend)
 # Version precedence: build arg VERSION > exact git tag > cmd/server/VERSION
-RUN VERSION_VALUE="${VERSION}" && \
+RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=sub2api-gobuild,target=/root/.cache/go-build \
+    --mount=type=tmpfs,target=/tmp,size=4294967296 \
+    VERSION_VALUE="${VERSION}" && \
     if [ -z "${VERSION_VALUE}" ]; then VERSION_VALUE="$(./scripts/resolve-version.sh)"; fi && \
     DATE_VALUE="${DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \
     CGO_ENABLED=0 GOOS=linux go build \
