@@ -17,6 +17,11 @@ services:
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmmirror.com}
     container_name: sub2api-dev
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     security_opt:
       - no-new-privileges:true
     ports:
@@ -121,6 +126,11 @@ services:
     image: postgres:18-alpine
     container_name: sub2api-postgres-dev
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./postgres_data:/var/lib/postgresql/data:Z
     environment:
@@ -142,6 +152,11 @@ services:
     image: redis:8-alpine
     container_name: sub2api-redis-dev
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./redis_data:/data:Z
     # The command is one quoted script for the inner `sh -c`. Compose keeps

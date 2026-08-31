@@ -1,2 +1,15 @@
 .cache/
 .DS_Store
+.env
+.env.*
+.git/
+.idea/
+.vscode/
+bin/
+build/
+coverage/
+logs/
+tmp/
+*.log
+*.tmp
+*_test.go
