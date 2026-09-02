@@ -8,20 +8,33 @@ context: |
   System boundaries and Phase acceptance criteria are defined by ../ops/docs/RELAY_STATION_SYSTEM_DESIGN_CN.md v1.8 / R4.7.
   Architecture decisions are defined by ../ops/docs/adr/0002-use-sub2api-native-downstream-scheduling.md.
 
-  Gateway is one Sub2API deployment and is the AI request data plane. Sub2API native Account/Group routing and native health, failover, breaker, cooldown, priority, load, and concurrency behavior remain authoritative.
-  Relay Station must not add Relay Cluster, P2C, Relay-specific retry/failover/breaker/session affinity/drain, Relay Node identity, Control Node IDs, a second scheduler, or a second topology authority.
-  Phase 4 adds only a readonly API Account Directory integration surface. It must not become an AI request-path dependency, and its success or failure must not alter routing/scheduling semantics. The data plane has higher resource priority. Control never connects directly to Gateway PostgreSQL.
+  One Sub2API deployment equals one Relay Station Gateway. Gateway is the AI request data plane. The current phase has no GatewayInstance collection, multi-Gateway control model, or Gateway cluster.
+  Sub2API native Account, Group, account_groups, user/API-key routing, priority, model routing, persistent Account status/configuration, load, runtime concurrency, cooldown, transient health, breaker, and failover remain authoritative according to the pinned Sub2API version. Relay Station must not create a second configuration or runtime scheduling truth.
+  ADR-0002 supersedes Relay Cluster, Node Pool, upstream_clusters, Cluster membership, NodeConnector, P2C, Relay candidate/capability filtering, Relay weight/retry/cross-node replay/failover/circuit breaker/session affinity/drain, effective-capacity scheduling, and Relay scheduler Redis state. Reintroducing any of them is an architecture scope violation requiring a new architecture review.
 
-  First-version Directory membership is deleted_at IS NULL and type in ('apikey', 'upstream'). oauth, setup-token, bedrock, service_account, and unknown future types are excluded fail-closed.
-  Each Account entry contains only id, name, platform, type, nullable sanitized url, and status. The conceptual envelope contains schema_version, generated_at, and accounts.
-  The Directory is full, non-paginated, from one consistent snapshot, and ordered by accounts.id ASC. HTTP 200 means complete and untruncated; success-shaped partial responses are forbidden. An empty accounts array is valid.
-  The Directory must not expose Group data, credentials, scheduler internals, raw errors, or arbitrary metadata. Use an allowlist projection, not redaction of a full Account DTO.
+  The only new core Gateway capability in Phase 4 is a readonly API Account Directory. It is an Account candidate directory, not Relay topology. Gateway does not know Relay Node identity, store Control Node IDs, maintain Relay membership or Gateway-side Relay scope, or become topology authority.
+  First-version membership is deleted_at IS NULL and type in ('apikey', 'upstream'). oauth, setup-token, bedrock, service_account, and unknown future types are excluded fail-closed. Account active/disabled/error, schedulable, priority, rate limit, load, concurrency, cooldown, overload, breaker, recent traffic, and current selection do not affect membership.
+  Each Account entry contains only id, name, platform, type, nullable sanitized url, and status. Only accounts.id is the binding identity reference; the other fields are recognition context and must not drive automatic Relay identity.
+  The conceptual envelope contains only schema_version, generated_at, and accounts. Do not add revision, hash, ETag, cursor/next_cursor, total_count, scheduler revision, database LSN, or projection_complete by default. A future defensive projection_complete must never make HTTP 200 plus false valid.
 
-  First-version authentication is the dedicated relay_control_reader identity using an independent high-entropy service token over TLS on a restricted management network. Authorize only GET on the exact Directory route. Do not reuse Gateway admin JWT/session, user API Keys, CLIProxyAPI Management Keys, or OAuth tokens.
-  Gateway-internal DB access for the Directory must not gain generic credential-read permission merely to obtain a base URL.
-  OpenSpec must define hard limits for Account count, response bytes, query timeout, HTTP timeout, concurrency, and request rate. Exceeding any limit causes explicit whole-request failure; truncation, first-N, and partial responses are forbidden.
+  The Directory is full, non-paginated, consistent, and ordered by accounts.id ASC. HTTP 200 means complete, valid, and untruncated; an empty accounts array is valid. Partial, truncated, best-effort, or first-N success responses are forbidden; inability to generate the complete Directory causes explicit non-2xx failure.
+  Prefer one SQL statement over one PostgreSQL MVCC snapshot for membership filtering, approved projection, source time, and ordering. If multiple statements are necessary, use READ ONLY REPEATABLE READ or equivalent consistent-snapshot semantics. generated_at is Gateway source/database snapshot time, not Control time, response completion time, or an arbitrary post-query application clock.
+
+  url is string or null and may contain only a safe scheme://host[:port][/path] locator. Remove userinfo, query, fragment, embedded API key/token/password, proxy credentials, and other secret-bearing components. Missing, malformed, or unsafe source data yields null; sanitization failure must never fall back to the raw URL.
+  The Directory must not expose API Key plaintext, OAuth/refresh/access/setup tokens, full credentials/extra JSON, proxy credentials, raw Account/upstream errors, Group IDs/names/membership, routing relationships/configuration, priority, concurrency, schedulable, load, rate-limit/cooldown/overload/breaker state, retry policy, scheduler score/state, model routing, or arbitrary metadata.
+  Use an independent minimal allowlist projection, not full Account DTO loading followed by redaction. Full credentials and extra must not enter the response pipeline. Reading a URL source such as credentials.base_url must not grant a Gateway-internal Directory reader generic credentials JSONB access; use a least-privilege safe projection/view/function/query. Control never connects directly to Gateway PostgreSQL.
+
+  First-version authentication is the dedicated relay_control_reader identity using an independent high-entropy service token over TLS on a restricted management network; mTLS is optional future hardening, not a v1 acceptance requirement. Authorize only GET on the exact Directory route. Reject other methods, neighboring internal endpoints, and admin accounts/users/groups/api-key/credential APIs.
+  Do not reuse Gateway admin JWT/session/cookies, ordinary user or Sub2API API Keys, CLIProxyAPI Management Keys, OAuth tokens, or other application secrets. Restricted management network, TLS, and service authentication are all required and do not replace one another; the Directory must not be naturally reachable through the public AI ingress.
+
+  The Directory is side-effect-free: it must not update Account/last_used/accessed_at, refresh scheduler/routing, change schedulable/cooldown/breaker, use FOR UPDATE or business advisory locks, or advance scheduler revision. Normal redacted access logs and metrics are allowed.
+  The Directory must not become an AI request-path dependency, and success, failure, timeout, throttling, or Control stopping polls must not alter routing/scheduling semantics. AI request data-plane resources have higher priority; under DB/CPU pressure, bursts, retry storms, timeout, or budget exhaustion, Directory fails or throttles instead of degrading the data plane.
+  OpenSpec must define hard limits for Account count, response bytes, DB query timeout, HTTP total timeout, max concurrency, and per-identity rate. Any limit causes explicit whole-request failure; truncation, first-N, and partial success are forbidden.
+  Client errors and logs expose only stable redacted classifications and must not leak SQL, table names, DB hostnames, stack traces, raw URLs, credentials/tokens, proxy secrets, raw Account errors, or scheduler internals.
+  First-version non-goals include pagination, cache, ETag/If-None-Match, revision, delta, change stream, CDC, WebSocket, and SSE.
 
   The first Phase 4 change is add-api-account-directory. Its scope is only the readonly Directory contract, authentication/authorization, safe projection and URL handling, consistency, limits, redaction, and data-plane resource isolation. Control ingestion/binding/duplicate ownership, Group export, scheduler changes, Cluster/P2C, retry/breaker/drain changes, and CLIProxyAPI changes are non-goals.
+  The existing add-openai-compatible-prompt-audit change is unrelated and must not be modified, merged, archived, or reinterpreted as Phase 4 work.
   Phase 4 capabilities are planned but not implemented; do not describe them as current behavior before acceptance.
   Use Conventional Commits. Keep changes scoped to one independently reviewable capability.
 
@@ -30,11 +43,12 @@ rules:
     - State the phase, operator outcome, explicit scope, dependencies, affected truth sources, and non-goals.
     - Reference relevant System Design v1.8 / R4.7 and ADR-0002 sections.
     - Call out compatibility, security, rollback, data-plane isolation, and upstream synchronization impact.
+    - Treat any Relay Cluster/Scheduler/P2C/Relay retry/breaker/affinity/drain proposal as an architecture violation requiring a new architecture review, not a normal Phase 4 extension.
   specs:
     - Express externally observable behavior with SHALL or MUST and testable scenarios.
-    - Include authentication/authorization negative tests, credential leakage tests, URL sanitization, consistency, limits, timeout, concurrency/rate, and data-plane isolation scenarios.
+    - Include positive, negative, authorization, secret-leakage, unknown-Account-type, URL sanitization, complete-vs-partial, hard-limit, timeout, concurrency/rate, and data-plane isolation scenarios.
   design:
-    - Preserve Sub2API native routing/scheduling and describe query consistency, allowlist projection, Secret handling, redaction, resource isolation, failure semantics, rollout, and rollback.
+    - Preserve Sub2API native routing/scheduling and describe query consistency, least privilege, allowlist projection, Secret handling, logging/redaction, resource isolation, failure semantics, rollout, and rollback.
     - Explain why Directory failures cannot mutate Account state or routing/scheduling behavior.
   tasks:
     - Keep tasks small, ordered, independently verifiable, and normally no larger than two hours.
