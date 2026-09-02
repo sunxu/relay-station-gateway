@@ -1,20 +1,41 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Language: zh-CN
+  All artifacts must be written in zh-CN.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: Relay Station Gateway, based on Sub2API.
+  System boundaries and Phase acceptance criteria are defined by ../ops/docs/RELAY_STATION_SYSTEM_DESIGN_CN.md v1.8 / R4.7.
+  Architecture decisions are defined by ../ops/docs/adr/0002-use-sub2api-native-downstream-scheduling.md.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Gateway is one Sub2API deployment and is the AI request data plane. Sub2API native Account/Group routing and native health, failover, breaker, cooldown, priority, load, and concurrency behavior remain authoritative.
+  Relay Station must not add Relay Cluster, P2C, Relay-specific retry/failover/breaker/session affinity/drain, Relay Node identity, Control Node IDs, a second scheduler, or a second topology authority.
+  Phase 4 adds only a readonly API Account Directory integration surface. It must not become an AI request-path dependency, and its success or failure must not alter routing/scheduling semantics. The data plane has higher resource priority. Control never connects directly to Gateway PostgreSQL.
+
+  First-version Directory membership is deleted_at IS NULL and type in ('apikey', 'upstream'). oauth, setup-token, bedrock, service_account, and unknown future types are excluded fail-closed.
+  Each Account entry contains only id, name, platform, type, nullable sanitized url, and status. The conceptual envelope contains schema_version, generated_at, and accounts.
+  The Directory is full, non-paginated, from one consistent snapshot, and ordered by accounts.id ASC. HTTP 200 means complete and untruncated; success-shaped partial responses are forbidden. An empty accounts array is valid.
+  The Directory must not expose Group data, credentials, scheduler internals, raw errors, or arbitrary metadata. Use an allowlist projection, not redaction of a full Account DTO.
+
+  First-version authentication is the dedicated relay_control_reader identity using an independent high-entropy service token over TLS on a restricted management network. Authorize only GET on the exact Directory route. Do not reuse Gateway admin JWT/session, user API Keys, CLIProxyAPI Management Keys, or OAuth tokens.
+  Gateway-internal DB access for the Directory must not gain generic credential-read permission merely to obtain a base URL.
+  OpenSpec must define hard limits for Account count, response bytes, query timeout, HTTP timeout, concurrency, and request rate. Exceeding any limit causes explicit whole-request failure; truncation, first-N, and partial responses are forbidden.
+
+  The first Phase 4 change is add-api-account-directory. Its scope is only the readonly Directory contract, authentication/authorization, safe projection and URL handling, consistency, limits, redaction, and data-plane resource isolation. Control ingestion/binding/duplicate ownership, Group export, scheduler changes, Cluster/P2C, retry/breaker/drain changes, and CLIProxyAPI changes are non-goals.
+  Phase 4 capabilities are planned but not implemented; do not describe them as current behavior before acceptance.
+  Use Conventional Commits. Keep changes scoped to one independently reviewable capability.
+
+rules:
+  proposal:
+    - State the phase, operator outcome, explicit scope, dependencies, affected truth sources, and non-goals.
+    - Reference relevant System Design v1.8 / R4.7 and ADR-0002 sections.
+    - Call out compatibility, security, rollback, data-plane isolation, and upstream synchronization impact.
+  specs:
+    - Express externally observable behavior with SHALL or MUST and testable scenarios.
+    - Include authentication/authorization negative tests, credential leakage tests, URL sanitization, consistency, limits, timeout, concurrency/rate, and data-plane isolation scenarios.
+  design:
+    - Preserve Sub2API native routing/scheduling and describe query consistency, allowlist projection, Secret handling, redaction, resource isolation, failure semantics, rollout, and rollback.
+    - Explain why Directory failures cannot mutate Account state or routing/scheduling behavior.
+  tasks:
+    - Keep tasks small, ordered, independently verifiable, and normally no larger than two hours.
+    - End with contract, security-negative, concurrent-mutation, hard-limit, performance-isolation, regression, evidence, and clean-worktree checks.
