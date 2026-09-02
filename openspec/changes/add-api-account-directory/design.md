@@ -32,7 +32,7 @@
 
 ### 1. 使用独立垂直模块和精确 route
 
-新增小型 `backend/internal/directory/` 模块，内部包含 config、auth middleware、projection repository、URL sanitizer、service、handler 和测试；route 文件只在 `/internal/v1/api-account-directory` 注册 GET，并通过现有 server composition 注入。成功响应直接写 Directory envelope，不套用面板 `response.Response`，否则顶层会多出 `code/message/data` 并违反契约；失败响应使用该模块自己的固定 `{code, message}` allowlist envelope。
+新增小型 `backend/internal/directory/` 模块，内部包含 config、auth middleware、projection repository、URL sanitizer、service、handler 和测试；route 文件只在 `/internal/v1/api-account-directory` 注册 GET，并通过现有 server composition 注入。成功响应直接写 Directory envelope，`schema_version` 使用 Go integer 字段并编码为 JSON number `1`，不套用面板 `response.Response`，否则顶层会多出 `code/message/data` 并违反契约；失败响应使用该模块自己的固定 `{code, message}` allowlist envelope。
 
 不把方法加入庞大的 `service.AccountRepository`：现有接口被大量 scheduler、admin 和测试 stub 实现，扩展会放大无关修改面，而且完整 Account DTO 含 Secret。
 
@@ -112,14 +112,16 @@ Raw source 只存在于单行 scan local variable，不写日志、error、metri
 
 ### 5. 独立 service-token authentication
 
-使用 `Authorization: Bearer`，严格限制 header 大小和单一 scheme；Gateway runtime 只验证 token decoded length 至少 32 bytes，并以 constant-time comparison 校验当前 Secret，不尝试运行时熵估计。Ops deployment 必须用 CSPRNG 生成至少 256 bits random material。Middleware 只设置不可伪造的 HTTP identity `relay_control_reader`，不设置 user/admin role，也不调用 admin/JWT/API-key service。
+Ops 使用 CSPRNG 生成至少 32 random bytes，再以 RFC 4648 unpadded Base64URL（Go `base64.RawURLEncoding` 等价语义）编码。HTTP wire format 固定为 `Authorization: Bearer <base64url-token>`；middleware 严格限制 header 大小和单一 Bearer scheme。
 
-配置默认 disabled。启用时必须存在有效 token Secret；轮换采用部署 Secret 同时配置 current 与短期 previous token，previous 只在显式 rotation window 内有效，窗口结束后移除并 reload/restart。日志只记录固定 identity label，绝不记录 header、token hash 或 prefix。
+Gateway 在启动/reload 时用 unpadded Base64URL 解码 configured current 和可选 previous token；任一 configured token malformed 或 decoded length 少于 32 bytes 时拒绝启用 Directory。每个请求同样先严格 decode bearer token并检查 decoded length，malformed/short token 统一 401；通过格式检查后，再对 decoded bytes 做 constant-time comparison。Runtime 不估计熵，随机性由 Ops 生成流程保证。Current/previous 使用完全相同格式和校验；previous 只在显式 rotation window 内有效，窗口结束后移除并 reload/restart。
+
+Middleware 只设置不可伪造的 HTTP identity `relay_control_reader`，不设置 user/admin role，也不调用 admin/JWT/API-key service。日志只记录固定 identity label，绝不记录 encoded/decoded token、hash 或 prefix。
 
 职责边界固定为：
 
 - Gateway：精确 route、authentication、config hooks、default-disabled、runtime token length 和专用 DB config 校验。
-- Ops：生产 TLS termination、management source ACL、public-ingress deny、CSPRNG token 与数据库 Secret deployment。
+- Ops：生产 TLS termination、management source ACL、public-ingress deny、至少 32 random bytes 的 CSPRNG token 生成、unpadded Base64URL 编码与数据库 Secret deployment。
 
 public AI ingress 不路由 `/internal/v1/*`。应用层 route auth 是独立边界，不因为网络或 TLS 存在而省略；Ops 前置条件未验证完成前不得设置 enabled。
 
@@ -197,10 +199,11 @@ latency_ms, row_count, response_bytes, failure_class
 
 ## Migration Plan
 
-1. 合入 SQL migration，创建/校验 NOLOGIN `relay_directory_definer`、LOGIN `relay_directory_db_reader`、function、grant/revoke 和 4096-byte projection ceiling；先运行 privilege probes，不启用 HTTP route。
-2. Ops 使用 CSPRNG 生成至少 256-bit token material 和独立数据库 Secret，配置 production TLS、management ACL 与 public-ingress deny，保持 Directory disabled；Control 只接收 HTTP token。
-3. 部署 Gateway module，运行 contract、secret-negative、并发 mutation、hard-limit 与 data-plane isolation tests。
-4. 启用 Directory，先从 management network 执行空/小/容量边界 smoke tests，再让 Control 以 180 秒周期 polling。
-5. 观察 latency、busy/rate/timeout、row count 和 response bytes；任何异常先停用 Directory route，不修改 Account 或 scheduler。
+1. 在实施 migration 前验证现有 migration executor 是否具备创建、ALTER 和管理 `relay_directory_definer`/`relay_directory_db_reader` 及 function ownership/grant/revoke 所需权限；若不具备，由 Ops 使用受控数据库管理流程执行 role bootstrap，不得通过扩大 `relay_directory_db_reader` 权限解决。
+2. 合入 SQL migration，创建/校验 NOLOGIN `relay_directory_definer`、LOGIN `relay_directory_db_reader`、function、grant/revoke 和 4096-byte projection ceiling；先运行 privilege probes，不启用 HTTP route。
+3. Ops 使用 CSPRNG 生成至少 32 random bytes，以 unpadded Base64URL 编码 current/previous token，并部署独立数据库 Secret、production TLS、management ACL 与 public-ingress deny，保持 Directory disabled；Control 只接收 encoded HTTP token。
+4. 部署 Gateway module，运行 contract、secret-negative、并发 mutation、hard-limit 与 data-plane isolation tests。
+5. 启用 Directory，先从 management network 执行空/小/容量边界 smoke tests，再让 Control 以 180 秒周期 polling。
+6. 观察 latency、busy/rate/timeout、row count 和 response bytes；任何异常先停用 Directory route，不修改 Account 或 scheduler。
 
 回滚顺序为：停止 Control polling → 从 ingress 撤销 route → disable Gateway Directory/revoke token → 回滚应用。专用 function/role 可在确认无 caller 后由后续 migration 删除；即使暂时保留也没有业务写权限。整个回滚不需要恢复 Account、Group、binding 或 scheduler state。

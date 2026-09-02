@@ -6,8 +6,8 @@ Phase 4 需要让 Control 在不直连 Gateway PostgreSQL、也不复制 Sub2API
 
 - 新增 `GET /internal/v1/api-account-directory`，向专用 `relay_control_reader` service identity 返回完整、非分页、按 `accounts.id ASC` 排序的 API Account snapshot。
 - 第一版成员严格限定为未软删除且 `type IN ('apikey', 'upstream')` 的 Sub2API Account；其他已知类型和未知未来类型 fail-closed 排除，Account 状态及 scheduler/runtime state 不影响成员资格。
-- 每个条目只返回 `id`、`name`、`platform`、`type`、nullable sanitized `url` 和 persistent `status`；envelope 只返回 `schema_version`、Gateway source/database snapshot time `generated_at` 和 `accounts`。
-- 新增独立 service token 鉴权、精确 route/method 授权、TLS 与 restricted management network 部署约束，以及带 4096-byte `credentials.base_url` ceiling 的最小数据库投影和 Secret/log/error 脱敏要求。
+- 每个条目只返回 `id`、`name`、`platform`、`type`、nullable sanitized `url` 和 persistent `status`；envelope 只返回 JSON integer `schema_version=1`、Gateway source/database snapshot time `generated_at` 和 `accounts`。
+- 新增独立 service token 鉴权：Ops 使用 CSPRNG 生成至少 32 random bytes 并采用 unpadded Base64URL wire format；同时增加精确 route/method 授权、TLS 与 restricted management network 部署约束，以及带 4096-byte `credentials.base_url` ceiling 的最小数据库投影和 Secret/log/error 脱敏要求。
 - 新增完整性、相互独立的响应大小与 Account 数、数据库查询时间、HTTP 总时间、并发和单 identity token-bucket hard limits；任何失败或超限都返回仅含 `code`、`message` 的明确 non-2xx，禁止部分成功、截断或 first-N。
 - 所有 Directory 成功和失败响应设置 `Cache-Control: no-store`。
 - 保证 Directory side-effect-free，并在资源竞争时优先失败或限流，不能改变或拖累 Sub2API 原生 AI 请求路由与调度。

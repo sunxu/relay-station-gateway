@@ -5,11 +5,11 @@
 ## ADDED Requirements
 
 ### Requirement: Directory endpoint and versioned envelope
-Gateway SHALL 在 `GET /internal/v1/api-account-directory` 返回第一版 Directory JSON；成功响应顶层 SHALL 只包含 `schema_version`、`generated_at` 和 `accounts`，其中 `schema_version` 固定为字符串 `"1"`，`generated_at` 为 UTC RFC 3339 时间，`accounts` 为 JSON array。所有由 Directory route 产生的成功和失败响应 SHALL 包含 `Cache-Control: no-store`。
+Gateway SHALL 在 `GET /internal/v1/api-account-directory` 返回第一版 Directory JSON；成功响应顶层 SHALL 只包含 `schema_version`、`generated_at` 和 `accounts`，其中 `schema_version` 固定为 JSON integer `1`，不得编码为 string，`generated_at` 为 UTC RFC 3339 时间，`accounts` 为 JSON array。所有由 Directory route 产生的成功和失败响应 SHALL 包含 `Cache-Control: no-store`。
 
 #### Scenario: Successful response shape
 - **WHEN** 已授权的 `relay_control_reader` 调用精确 GET route 且 Gateway 能生成完整 Directory
-- **THEN** Gateway 返回 HTTP 200，body 只包含 `schema_version="1"`、数据库 snapshot time `generated_at` 和 `accounts`
+- **THEN** Gateway 返回 HTTP 200，body 只包含 JSON integer `schema_version=1`、数据库 snapshot time `generated_at` 和 `accounts`
 
 #### Scenario: Successful response disables storage
 - **WHEN** Gateway 返回任一成功 Directory response
@@ -115,23 +115,31 @@ Gateway SHALL 仅从批准的 Account `credentials.base_url` scalar string 生�
 - **THEN** Gateway 返回保持有效方括号语法的 sanitized origin
 
 ### Requirement: Dedicated service authentication
-Directory SHALL 只接受独立 `relay_control_reader` service token，并通过 `Authorization: Bearer <token>` 传递。Gateway runtime SHALL 解码 token 并验证 decoded length 至少为 32 bytes；Ops deployment SHALL 使用 CSPRNG 生成至少 256 bits random material。Token SHALL 与 Gateway admin JWT/session/cookie、普通用户或 Sub2API API Key、CLIProxyAPI Management Key、OAuth token 及其他应用 Secret 相互独立。
+Directory SHALL 只接受独立 `relay_control_reader` service token。Ops SHALL 使用 CSPRNG 生成至少 32 random bytes，并使用 unpadded Base64URL 编码；HTTP wire format SHALL 为 `Authorization: Bearer <base64url-token>`。Gateway SHALL 使用 unpadded Base64URL 规则成功解码 bearer token，并验证 decoded length 至少为 32 bytes；malformed encoding 或不足 32 bytes MUST fail-closed。Current 和 previous rotation token SHALL 使用相同格式，decoded token comparison SHALL 保持 constant-time。Token SHALL 与 Gateway admin JWT/session/cookie、普通用户或 Sub2API API Key、CLIProxyAPI Management Key、OAuth token 及其他应用 Secret 相互独立。
 
 #### Scenario: Valid reader token
 - **WHEN** caller 提交当前有效的独立 reader token
 - **THEN** Gateway 将 caller 识别为 `relay_control_reader` 并继续执行 route 授权和资源准入
 
 #### Scenario: Missing or invalid token
-- **WHEN** token 缺失、格式错误、过期或不匹配
+- **WHEN** token 缺失、过期或不匹配
 - **THEN** Gateway 返回统一 HTTP 401，且不得查询 Directory 或泄漏 token 配置状态
 
 #### Scenario: Reused application credential
 - **WHEN** caller 提交有效 admin JWT、admin API key、普通 API Key、OAuth token 或 CLIProxyAPI Management Key
 - **THEN** Gateway 返回 HTTP 401，不将该凭据解释为 Directory reader token
 
-#### Scenario: Runtime token too short
-- **WHEN** 配置的 service token 可解码但 decoded length 少于 32 bytes
-- **THEN** Gateway 拒绝启用 Directory，不以运行时熵估计替代长度校验
+#### Scenario: Malformed Base64URL token
+- **WHEN** configured current/previous token 或请求 bearer token 不是合法 unpadded Base64URL
+- **THEN** Gateway fail-closed：非法配置阻止 Directory 启用，非法请求返回统一 HTTP 401，且不得执行 Directory 查询
+
+#### Scenario: Short decoded token
+- **WHEN** configured current/previous token 或请求 bearer token 可解码但 decoded length 少于 32 bytes
+- **THEN** Gateway fail-closed：过短配置阻止 Directory 启用，过短请求返回统一 HTTP 401，且不以运行时熵估计替代长度校验
+
+#### Scenario: Rotation token format
+- **WHEN** Gateway 在显式 rotation window 内接受 previous token
+- **THEN** previous token 与 current token 使用相同 unpadded Base64URL decode、至少 32 decoded bytes 和 constant-time comparison 规则
 
 ### Requirement: Exact authorization and management-network isolation
 HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Directory route。Gateway SHALL 负责 route、authentication、config hooks 和 default-disabled 行为；Ops SHALL 负责生产 TLS、restricted management network ACL、public-ingress deny 和 HTTP/DB Secret deployment。任一边界 MUST NOT 替代另一个，部署前置条件未满足时 Directory MUST 保持 disabled，且 MUST NOT 通过 public AI ingress 暴露。
