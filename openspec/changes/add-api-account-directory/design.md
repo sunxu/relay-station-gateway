@@ -38,25 +38,42 @@
 
 **备选方案：复用 `/api/v1/admin/accounts`。** 放弃，因为它接受 admin trust domain、分页且加载远多于六个字段。
 
-### 2. 数据库 SECURITY DEFINER projection 加专用 pool
+### 2. 三个身份与专用数据库投影
 
-通过不可变 SQL migration 创建专用 database role `relay_control_reader` 和单一 `SECURITY DEFINER` set-returning function。Function 固定：
+三个身份严格分离：
+
+- HTTP identity：`relay_control_reader`，只由 Gateway service-token middleware 建立。
+- Gateway DB runtime role：`relay_directory_db_reader`，LOGIN，仅由 Gateway 专用 pool 使用。
+- Function owner：`relay_directory_definer`，NOLOGIN，只拥有实现 projection 所需对象权限。
+
+Control 只获得 HTTP token，不获得任何 Gateway DB credential。通过不可变 SQL migration 创建两个数据库 role 和单一 `SECURITY DEFINER` set-returning function。Function 固定：
 
 ```sql
 WHERE deleted_at IS NULL
   AND type IN ('apikey', 'upstream')
 ORDER BY id ASC
+LIMIT 10001
 ```
 
 并只返回：
 
 ```text
-id, name, platform, type, credentials ->> 'base_url' AS url_source, status
+id, name, platform, type,
+CASE
+  WHEN jsonb_typeof(credentials -> 'base_url') = 'string'
+  THEN CASE
+    WHEN octet_length(credentials ->> 'base_url') <= 4096
+    THEN credentials ->> 'base_url'
+    ELSE NULL
+  END
+  ELSE NULL
+END AS url_source,
+status
 ```
 
-Function owner 只拥有实现该 projection 所需权限，固定 `search_path`，所有对象 schema-qualified；撤销 public execute。运行 role 只有该 function 的 execute 权限，没有 `accounts`、`credentials`、`extra` 或其他表的直接 SELECT 权限。
+`relay_directory_definer` 固定 `search_path`，function 内所有对象 schema-qualified；撤销 PUBLIC execute。`relay_directory_db_reader` 只有该 function 的 execute 权限，没有 `accounts`、`credentials`、`extra` 或其他表的直接 SELECT 权限。4096-byte check 在 SQL projection 内完成，超长、非 string 或缺失值只返回 NULL，避免超大 raw scalar 穿过数据库边界。
 
-Gateway 新增专用数据库配置和 `sql.DB`：`MaxOpenConns=2`、`MaxIdleConns=0`、连接 lifetime 有界。Token Secret 与数据库 password 由部署 Secret/env 注入，禁止存入 settings、日志或 API。应用启动时若 Directory enabled 但 Secret、TLS/network deployment prerequisite 或专用数据库配置缺失，则拒绝启用该 route，而不是回退主 pool。
+Gateway 新增 `relay_directory_db_reader` 专用数据库配置和 `sql.DB`：`MaxOpenConns=2`、`MaxIdleConns=0`、连接 lifetime 有界。HTTP token Secret 与数据库 password 由 Ops 通过独立部署 Secret/env 注入，禁止存入 settings、日志、API 或 Control。Gateway config 默认 disabled；enabled 但 token/runtime DB config 无效时启动校验失败，不回退主 pool。
 
 **备选方案：复用 Ent Account query。** 放弃，因为 Ent materializes 完整 entity，并使用拥有通用表权限的主 pool。
 
@@ -79,13 +96,13 @@ LEFT JOIN directory ON TRUE
 ORDER BY directory.id ASC
 ```
 
-LEFT JOIN sentinel 让空目录也返回数据库 `generated_at`。扫描时将 nullable `id` 解释为空集合标记；非空行必须通过正 ID、唯一、严格递增和 required scalar 检查。SQL context deadline 为 2 秒。Function 和外层 statement 共享同一 PostgreSQL statement snapshot；不需要 transaction、`FOR UPDATE` 或 advisory lock。
+LEFT JOIN sentinel 让空目录也返回数据库 `generated_at`。扫描时将 nullable `id` 解释为空集合标记；非空行必须通过正 ID、唯一、严格递增和 required scalar 检查。Function 内 `LIMIT 10001` 是 bounded overflow sentinel，不是成功分页：扫描到第 10,001 个成员时丢弃全部结果并返回 413。Function 和外层 statement 共享同一 PostgreSQL statement snapshot；不需要 transaction、`FOR UPDATE` 或 advisory lock。
 
 **备选方案：先查时间再查 rows。** 放弃，因为需要显式 REPEATABLE READ transaction，增加连接占用和错误路径。
 
 ### 4. URL 第一版只输出 sanitized origin
 
-Projection DTO 的 `url_source` 是唯一允许短暂持有的敏感 scalar，读取后立即用 Go `net/url` 解析。只接受 absolute `http`/`https` 且 host 非空；使用 scheme、`Hostname()` 和合法显式 `Port()` 重建 origin，scheme/hostname 小写，IPv6 重新加方括号。永远丢弃 userinfo、path、query 和 fragment；解析或重建失败返回 null。
+Projection DTO 的 `url_source` 是唯一允许短暂持有的敏感 scalar，且数据库已经保证其为不超过 4096 bytes 的 string；读取后立即用 Go `net/url` 解析。只接受 absolute `http`/`https` 且 host 非空；使用 scheme、`Hostname()` 和合法显式 `Port()` 重建 origin，scheme/hostname 小写，IPv6 重新加方括号。永远丢弃 userinfo、path、query 和 fragment；缺失、非 string、超长、解析或重建失败均返回 null。
 
 这比尝试识别 path 中所有 token pattern 更保守，也满足 `scheme://host[:port][/path]` 中 path 可选的契约。没有配置 `base_url` 时不调用 `Account.GetBaseURL()` 推断 provider default，因为 Directory 应展示持久化 locator，而不是 runtime-derived routing。
 
@@ -95,11 +112,16 @@ Raw source 只存在于单行 scan local variable，不写日志、error、metri
 
 ### 5. 独立 service-token authentication
 
-使用 `Authorization: Bearer`，严格限制 header 大小和单一 scheme；token 解码后要求至少 32 个随机 bytes，并以 constant-time comparison 校验当前 Secret。Middleware 只设置不可伪造的内部 identity `relay_control_reader`，不设置 user/admin role，也不调用 admin/JWT/API-key service。
+使用 `Authorization: Bearer`，严格限制 header 大小和单一 scheme；Gateway runtime 只验证 token decoded length 至少 32 bytes，并以 constant-time comparison 校验当前 Secret，不尝试运行时熵估计。Ops deployment 必须用 CSPRNG 生成至少 256 bits random material。Middleware 只设置不可伪造的 HTTP identity `relay_control_reader`，不设置 user/admin role，也不调用 admin/JWT/API-key service。
 
 配置默认 disabled。启用时必须存在有效 token Secret；轮换采用部署 Secret 同时配置 current 与短期 previous token，previous 只在显式 rotation window 内有效，窗口结束后移除并 reload/restart。日志只记录固定 identity label，绝不记录 header、token hash 或 prefix。
 
-TLS termination 和 management source ACL 由 deployment reverse proxy/firewall 强制；public AI ingress 不路由 `/internal/v1/*`。应用层 route auth 是第三道独立边界，不因为网络或 TLS 存在而省略。
+职责边界固定为：
+
+- Gateway：精确 route、authentication、config hooks、default-disabled、runtime token length 和专用 DB config 校验。
+- Ops：生产 TLS termination、management source ACL、public-ingress deny、CSPRNG token 与数据库 Secret deployment。
+
+public AI ingress 不路由 `/internal/v1/*`。应用层 route auth 是独立边界，不因为网络或 TLS 存在而省略；Ops 前置条件未验证完成前不得设置 enabled。
 
 **备选方案：复用 admin API key/JWT。** 放弃，因为其权限远大于只读 route，且会耦合交互用户/session 生命周期。
 
@@ -111,10 +133,10 @@ TLS termination 和 management source ACL 由 deployment reverse proxy/firewall 
 management ingress/TLS
 → method/path routing
 → header shape + token auth
+→ start 3s total request deadline
 → per-identity rate admission
 → non-blocking concurrency semaphore
-→ 3s total context
-→ dedicated DB query with 2s deadline
+→ dedicated DB query with deadline=min(now+2s, total deadline)
 → validate + sanitize + encode into bounded buffer
 → single response write
 ```
@@ -128,11 +150,15 @@ management ingress/TLS
 | DB query | 2s | 503 `directory_query_timeout` |
 | HTTP total | 3s | 503 `directory_timeout` |
 | Concurrent executions | 2 | 429 `directory_busy` |
-| Identity rate | 10/min, burst 2 | 429 `directory_rate_limited` |
+| Identity rate | token bucket: refill 10/min, capacity 2, cost 1 | 429 `directory_rate_limited` |
 
-Count limit 通过扫描第 10,001 行判定，不使用 SQL `LIMIT 10001` 作为返回截断；一旦发现超限就整体失败。JSON 先编码到带 4 MiB ceiling 的内存 buffer，验证完成后才设置 200/write body，避免流式 partial success。
+3 秒 total deadline 在 authentication 成功后立即开始，覆盖 rate admission、semaphore、DB、validation、encoding 和 write preparation。DB query 单独最多 2 秒，但 deadline 取 `min(queryStart+2s, totalDeadline)`，不能延长总预算。
 
-Rate limiter 使用进程内、单 identity 的小型 token bucket；当前架构只有一个 Gateway，没必要引入 Redis failure mode。它 fail-closed，且在 semaphore/DB 之前执行。未来多 Gateway 会改变全局 rate semantics，必须另行评审，不能静默沿用本实现。
+Count limit 通过 SQL `LIMIT 10001` bounded sentinel 与应用扫描第 10,001 行判定；一旦发现超限就整体失败。JSON 先编码到带 4 MiB ceiling 的内存 buffer，验证完成后才设置 200/write body，避免流式 partial success。10,000 Account 与 4 MiB 是独立 limits：任一触发都失败，不以另一个未触发为放行理由。
+
+Rate limiter 使用进程内、单 identity token bucket：refill 10 tokens/minute、capacity 2、cost 1/request、non-blocking。它不是 strict rolling window。当前架构只有一个 Gateway，没必要引入 Redis failure mode；limiter fail-closed，且在 semaphore/DB 之前执行。未来多 Gateway 会改变全局 rate semantics，必须另行评审，不能静默沿用本实现。
+
+所有 Directory response 在最外层 middleware 设置 `Cache-Control: no-store`，包括 method/auth/rate/timeout/internal failures。Non-2xx 在写出前统一编码为只含两个 string 字段的 `{"code":"...","message":"..."}`；message 来自固定公开映射，不附加 metadata、reason、details 或底层错误。
 
 ### 7. Side-effect isolation by construction
 
@@ -149,7 +175,7 @@ request_id, identity=relay_control_reader, result,
 latency_ms, row_count, response_bytes, failure_class
 ```
 
-禁止把 query、driver error、URL source、Account name、platform/status cardinality、token 信息或数据库 endpoint 放入日志/metric label。内部错误先映射到固定 classification，再记录 classification；原始数据库错误只在内存中用于 `errors.Is` 分类，不格式化输出。
+禁止把 query、driver error、URL source、Account name、platform/status cardinality、token 信息或数据库 endpoint 放入日志/metric label。内部错误先映射到与 HTTP `code` 同词典的固定 `failure_class`，再记录该值；原始数据库错误只在内存中用于 `errors.Is` 分类，不格式化输出。
 
 指标至少覆盖 request result、latency、busy/rate/timeout、row count 与 response bytes。正常 access logging 必须依赖既有 header redaction，并增加 canary test 防止 Authorization 泄漏。
 
@@ -162,8 +188,8 @@ latency_ms, row_count, response_bytes, failure_class
 ## Risks / Trade-offs
 
 - **[10,000 Account 或 4 MiB 上限未来不足]** → 整体 413 并告警；先做容量测量，再通过新 OpenSpec 调整或引入新协议，禁止临时截断。
-- **[SECURITY DEFINER function 配置错误扩大权限]** → 固定 owner/search_path、schema-qualified object、撤销 PUBLIC、数据库 privilege regression test 和 migration review。
-- **[Raw `base_url` scalar 在应用内短暂存在]** → 独立 projection 只返回该 scalar，立即 origin-only sanitize，canary 测试覆盖 body/log/error；不加载 JSON object。
+- **[SECURITY DEFINER function 配置错误扩大权限]** → NOLOGIN `relay_directory_definer`、固定 search_path、schema-qualified object、撤销 PUBLIC、独立 runtime role、数据库 privilege regression test 和 migration review。
+- **[Raw `base_url` scalar 在应用内短暂存在]** → SQL 先执行 type 与 4096-byte ceiling，只返回有界 scalar，应用立即 origin-only sanitize，canary 测试覆盖 body/log/error。
 - **[进程内 rate limit 在未来多实例下不是全局限制]** → 当前单 Gateway 决策下接受；拓扑变化必须新架构评审。
 - **[Origin-only URL 降低管理员识别度]** → 安全优先保留 host/port；只有证明 path 必需且能建立严格 Secret policy 后才扩展。
 - **[同 listener 误暴露 internal route]** → reverse proxy/firewall 显式 deny public ingress，加部署 smoke test；service auth 仍独立 fail-closed。
@@ -171,8 +197,8 @@ latency_ms, row_count, response_bytes, failure_class
 
 ## Migration Plan
 
-1. 合入 SQL migration，创建/校验专用 role、function、owner、grant/revoke；先运行 privilege probes，不启用 HTTP route。
-2. 生成独立 256-bit 以上 token 和数据库 Secret，配置 management TLS ingress 与 source ACL，保持 Directory disabled。
+1. 合入 SQL migration，创建/校验 NOLOGIN `relay_directory_definer`、LOGIN `relay_directory_db_reader`、function、grant/revoke 和 4096-byte projection ceiling；先运行 privilege probes，不启用 HTTP route。
+2. Ops 使用 CSPRNG 生成至少 256-bit token material 和独立数据库 Secret，配置 production TLS、management ACL 与 public-ingress deny，保持 Directory disabled；Control 只接收 HTTP token。
 3. 部署 Gateway module，运行 contract、secret-negative、并发 mutation、hard-limit 与 data-plane isolation tests。
 4. 启用 Directory，先从 management network 执行空/小/容量边界 smoke tests，再让 Control 以 180 秒周期 polling。
 5. 观察 latency、busy/rate/timeout、row count 和 response bytes；任何异常先停用 Directory route，不修改 Account 或 scheduler。

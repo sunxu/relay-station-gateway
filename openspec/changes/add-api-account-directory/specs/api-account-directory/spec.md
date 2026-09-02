@@ -5,11 +5,15 @@
 ## ADDED Requirements
 
 ### Requirement: Directory endpoint and versioned envelope
-Gateway SHALL 在 `GET /internal/v1/api-account-directory` 返回第一版 Directory JSON；成功响应顶层 SHALL 只包含 `schema_version`、`generated_at` 和 `accounts`，其中 `schema_version` 固定为字符串 `"1"`，`generated_at` 为 UTC RFC 3339 时间，`accounts` 为 JSON array。
+Gateway SHALL 在 `GET /internal/v1/api-account-directory` 返回第一版 Directory JSON；成功响应顶层 SHALL 只包含 `schema_version`、`generated_at` 和 `accounts`，其中 `schema_version` 固定为字符串 `"1"`，`generated_at` 为 UTC RFC 3339 时间，`accounts` 为 JSON array。所有由 Directory route 产生的成功和失败响应 SHALL 包含 `Cache-Control: no-store`。
 
 #### Scenario: Successful response shape
 - **WHEN** 已授权的 `relay_control_reader` 调用精确 GET route 且 Gateway 能生成完整 Directory
 - **THEN** Gateway 返回 HTTP 200，body 只包含 `schema_version="1"`、数据库 snapshot time `generated_at` 和 `accounts`
+
+#### Scenario: Successful response disables storage
+- **WHEN** Gateway 返回任一成功 Directory response
+- **THEN** response 包含 `Cache-Control: no-store`
 
 #### Scenario: Empty complete directory
 - **WHEN** 一致性 snapshot 中不存在符合成员规则的 Account
@@ -18,6 +22,10 @@ Gateway SHALL 在 `GET /internal/v1/api-account-directory` 返回第一版 Direc
 #### Scenario: Unsupported method
 - **WHEN** caller 对该 path 使用 GET 以外的方法
 - **THEN** Gateway 拒绝请求，且不得执行 Directory 查询或返回 Directory 数据
+
+#### Scenario: Failed response disables storage
+- **WHEN** Directory route 因 method、authentication、authorization、限流、超限、timeout 或内部错误返回 non-2xx
+- **THEN** response 包含 `Cache-Control: no-store`
 
 ### Requirement: Fail-closed Account membership
 Gateway SHALL 只包含 snapshot 中 `deleted_at IS NULL` 且 `type IN ('apikey', 'upstream')` 的 Account。`status`、schedulable、priority、rate limit、load、concurrency、cooldown、overload、breaker、近期流量和当前是否被选择 MUST NOT 改变成员资格。
@@ -53,6 +61,10 @@ Gateway SHALL 只包含 snapshot 中 `deleted_at IS NULL` 且 `type IN ('apikey'
 - **WHEN** Gateway 无法为任一成员生成正整数且唯一的 `id`
 - **THEN** Gateway 将整个请求作为 snapshot integrity failure 返回 non-2xx，不得跳过该成员
 
+#### Scenario: Unknown platform and status strings
+- **WHEN** approved Account 包含当前 Gateway 未识别但仍为 string 的未来 `platform` 或 `status`
+- **THEN** Gateway 原样返回该 string，且不得仅因值未知而拒绝 snapshot
+
 ### Requirement: Stable ordering and complete snapshot
 Gateway SHALL 在一次请求中返回全部成员，并严格按 `accounts.id ASC` 排序。HTTP 200 SHALL 表示响应完整、有效且未截断；Gateway MUST NOT 以 pagination、first-N、best-effort、partial data 或 success-shaped completeness flag 代替完整响应。
 
@@ -80,7 +92,7 @@ Gateway SHALL 在一次请求中返回全部成员，并严格按 `accounts.id A
 - **THEN** Gateway 仍从同一个数据库 snapshot 返回有效 `generated_at`
 
 ### Requirement: Conservative URL sanitization
-Gateway SHALL 仅从批准的 Account `credentials.base_url` scalar string 生成辅助 `url`，不得推导平台默认 URL、读取 proxy URL 或读取 `extra`。第一版输出 SHALL 只保留合法绝对 HTTP(S) URL 的小写 scheme、host 和显式 port，即 `scheme://host[:port]`；path、userinfo、query、fragment 和任何潜在嵌入式 Secret MUST 被移除。缺失、非字符串、解析失败、非 HTTP(S)、缺少 host 或无法安全重建时 `url` SHALL 为 null，且 MUST NOT 回退原值。
+Gateway SHALL 仅从批准的 Account `credentials.base_url` scalar string 生成辅助 `url`，不得推导平台默认 URL、读取 proxy URL 或读取 `extra`。数据库 projection SHALL 在返回 scalar 前同时验证 JSON type 为 string 且 UTF-8 encoded value 不超过 4096 bytes；缺失、非 string 或超过 4096 bytes 时只向应用层返回 SQL NULL，不得读取超大 raw scalar。第一版输出 SHALL 只保留合法绝对 HTTP(S) URL 的小写 scheme、host 和显式 port，即 `scheme://host[:port]`；path、userinfo、query、fragment 和任何潜在嵌入式 Secret MUST 被移除。缺失、非字符串、超长、解析失败、非 HTTP(S)、缺少 host 或无法安全重建时 `url` SHALL 为 null，且 MUST NOT 回退原值。
 
 #### Scenario: URL with path and sensitive components
 - **WHEN** `credentials.base_url` 为带 userinfo、path、query 或 fragment 的合法 HTTP(S) URL
@@ -94,12 +106,16 @@ Gateway SHALL 仅从批准的 Account `credentials.base_url` scalar string 生�
 - **WHEN** URL source 非字符串、格式错误、使用非 HTTP(S) scheme、缺少 host 或无法安全解析
 - **THEN** Gateway 返回该 Account 且 `url` 为 null，不泄漏原始值，也不使完整 snapshot 失败
 
+#### Scenario: Oversized URL source
+- **WHEN** `credentials.base_url` string 的 UTF-8 encoded value 超过 4096 bytes
+- **THEN** database projection 向应用层返回 NULL，Gateway 返回该 Account 且 `url` 为 null，超大 raw scalar 不进入应用内存、日志或错误
+
 #### Scenario: IPv6 origin
 - **WHEN** URL source 使用合法 IPv6 host 和显式 port
 - **THEN** Gateway 返回保持有效方括号语法的 sanitized origin
 
 ### Requirement: Dedicated service authentication
-Directory SHALL 只接受独立 `relay_control_reader` high-entropy service token，并通过 `Authorization: Bearer <token>` 传递。Token SHALL 至少包含 256 bits 的安全随机熵，并与 Gateway admin JWT/session/cookie、普通用户或 Sub2API API Key、CLIProxyAPI Management Key、OAuth token 及其他应用 Secret 相互独立。
+Directory SHALL 只接受独立 `relay_control_reader` service token，并通过 `Authorization: Bearer <token>` 传递。Gateway runtime SHALL 解码 token 并验证 decoded length 至少为 32 bytes；Ops deployment SHALL 使用 CSPRNG 生成至少 256 bits random material。Token SHALL 与 Gateway admin JWT/session/cookie、普通用户或 Sub2API API Key、CLIProxyAPI Management Key、OAuth token 及其他应用 Secret 相互独立。
 
 #### Scenario: Valid reader token
 - **WHEN** caller 提交当前有效的独立 reader token
@@ -113,8 +129,12 @@ Directory SHALL 只接受独立 `relay_control_reader` high-entropy service toke
 - **WHEN** caller 提交有效 admin JWT、admin API key、普通 API Key、OAuth token 或 CLIProxyAPI Management Key
 - **THEN** Gateway 返回 HTTP 401，不将该凭据解释为 Directory reader token
 
+#### Scenario: Runtime token too short
+- **WHEN** 配置的 service token 可解码但 decoded length 少于 32 bytes
+- **THEN** Gateway 拒绝启用 Directory，不以运行时熵估计替代长度校验
+
 ### Requirement: Exact authorization and management-network isolation
-`relay_control_reader` SHALL 只被授权访问精确 GET Directory route。TLS 和 restricted management network SHALL 与 service authentication 同时成立；任一边界 MUST NOT 替代另一个，Directory MUST NOT 通过 public AI ingress 暴露。
+HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Directory route。Gateway SHALL 负责 route、authentication、config hooks 和 default-disabled 行为；Ops SHALL 负责生产 TLS、restricted management network ACL、public-ingress deny 和 HTTP/DB Secret deployment。任一边界 MUST NOT 替代另一个，部署前置条件未满足时 Directory MUST 保持 disabled，且 MUST NOT 通过 public AI ingress 暴露。
 
 #### Scenario: Neighboring internal route
 - **WHEN** 已认证 reader identity 请求其他 internal、admin、Account、Group、API-key 或 credential route
@@ -129,15 +149,23 @@ Directory SHALL 只接受独立 `relay_control_reader` high-entropy service toke
 - **THEN** 部署入口拒绝或不路由该请求，不允许仅凭 token 成功
 
 ### Requirement: Least-privilege data access
-Directory SHALL 使用独立 allowlist projection，只读取生成六个公开字段所需的列和 `credentials.base_url` scalar。完整 `credentials`、完整 `extra` 和完整 Account DTO MUST NOT 进入 Directory response pipeline；Directory 数据库身份 MUST NOT 获得对 `accounts.credentials` 或其他业务表的通用读取权限。Control MUST NOT 直接连接 Gateway PostgreSQL。
+Directory SHALL 使用独立 allowlist projection，只读取生成六个公开字段所需的列和经过 4096-byte ceiling 的 `credentials.base_url` scalar。Gateway 专用数据库 runtime role SHALL 为 `relay_directory_db_reader`；SECURITY DEFINER function owner SHALL 为 NOLOGIN `relay_directory_definer`。完整 `credentials`、完整 `extra` 和完整 Account DTO MUST NOT 进入 Directory response pipeline；`relay_directory_db_reader` MUST NOT 获得对 `accounts.credentials` 或其他业务表的通用读取权限。Control MUST NOT 直接连接 Gateway PostgreSQL，也 MUST NOT 获得任一 Gateway database credential。
 
 #### Scenario: Projection execution
 - **WHEN** Gateway 查询 Directory
 - **THEN** 数据访问层只产生 approved scalar projection，不加载 credentials/extra JSON object、Account relations 或 scheduler state
 
 #### Scenario: Reader database privilege probe
-- **WHEN** 使用 Directory 数据库身份尝试直接读取 `accounts`、`credentials` 或非批准业务对象
+- **WHEN** 使用 `relay_directory_db_reader` 尝试直接读取 `accounts`、`credentials` 或非批准业务对象
 - **THEN** PostgreSQL 拒绝访问，同时仍允许执行精确 Directory projection
+
+#### Scenario: Definer cannot log in
+- **WHEN** caller 尝试以 `relay_directory_definer` 建立数据库连接
+- **THEN** PostgreSQL 拒绝登录，同时该 role 仍可作为 SECURITY DEFINER function owner
+
+#### Scenario: Control receives no database credential
+- **WHEN** Ops 为 Control 配置 Directory polling
+- **THEN** Control 只获得 `relay_control_reader` HTTP token 和 management endpoint，不获得 `relay_directory_db_reader` 或 `relay_directory_definer` credential
 
 ### Requirement: No secret or internal-state disclosure
 成功响应、错误响应、日志和指标 MUST NOT 包含 API Key plaintext、access/refresh/setup token、service token、完整 credentials/extra、proxy credential、raw URL、raw Account/upstream error、SQL、表名、数据库 hostname、stack trace、Group 或 routing relationship、priority、concurrency、schedulable、load、rate-limit/cooldown/overload/breaker、retry policy、scheduler score/state 或 model routing。
@@ -148,7 +176,7 @@ Directory SHALL 使用独立 allowlist projection，只读取生成六个公开�
 
 #### Scenario: Internal query failure
 - **WHEN** PostgreSQL 返回包含 SQL、relation 或 hostname 的详细错误
-- **THEN** client 只收到稳定的脱敏 failure classification，日志也不记录原始错误文本
+- **THEN** client 只收到稳定的脱敏 error `code` 和固定公开 `message`，日志也不记录原始错误文本
 
 ### Requirement: Side-effect-free read path
 Directory SHALL 是纯读取路径。它 MUST NOT 更新 Account 或 last-used/accessed 字段、刷新 credential、触发 scheduler outbox/cache/routing refresh、改变 schedulable/cooldown/breaker、使用 `FOR UPDATE` 或业务 advisory lock、推进 scheduler revision，或调用上游 AI/Relay Node。
@@ -162,53 +190,73 @@ Directory SHALL 是纯读取路径。它 MUST NOT 更新 Account 或 last-used/a
 - **THEN** 同样不产生任何 Account、routing、scheduler 或 upstream side effect
 
 ### Requirement: Fixed hard limits and whole-request failure
-第一版 Directory SHALL 使用以下 hard limits：最多 10,000 个 Account、最多 4 MiB 序列化 response body、2 秒数据库查询 timeout、3 秒 HTTP handler 总 timeout、最多 2 个并发执行中的 Directory 请求。任一 hard limit 被触发时 SHALL 整体失败，不得截断、分页或返回部分结果。
+第一版 Directory SHALL 使用以下相互独立的 hard limits：最多 10,000 个 Account、最多 4 MiB 序列化 response body、2 秒数据库查询 timeout、authentication 成功后 3 秒 HTTP total request deadline、最多 2 个并发执行中的 Directory 请求。Gateway SHALL 在 authentication 成功后立即启动 total deadline；DB query deadline SHALL 为 query 开始时刻加 2 秒与剩余 total deadline 两者中的较早者。任一 hard limit 被触发时 SHALL 整体失败，不得截断、分页或返回部分结果。数据库可以用最多 10,001 行的 bounded sentinel query 检测 Account overflow。
 
 #### Scenario: Account count limit
 - **WHEN** 一致性 snapshot 包含超过 10,000 个成员
-- **THEN** Gateway 返回 HTTP 413 和稳定 classification `directory_account_limit_exceeded`，不返回 Account item
+- **THEN** Gateway 通过第 10,001 个 sentinel member 检测 overflow，返回 HTTP 413 和 code `directory_account_limit_exceeded`，不返回 Account item 或 first-N success
 
 #### Scenario: Response byte limit
 - **WHEN** 完整 JSON body 将超过 4 MiB
-- **THEN** Gateway 返回 HTTP 413 和稳定 classification `directory_response_limit_exceeded`，不发送被截断 body
+- **THEN** Gateway 返回 HTTP 413 和 code `directory_response_limit_exceeded`，不发送被截断 body
 
 #### Scenario: Database query timeout
 - **WHEN** Directory projection 在 2 秒内未完成
-- **THEN** Gateway 取消查询并返回 HTTP 503 和稳定 classification `directory_query_timeout`
+- **THEN** Gateway 在不晚于剩余 total deadline 时取消查询，并返回 HTTP 503 和 code `directory_query_timeout` 或已先到期的 `directory_timeout`
 
 #### Scenario: HTTP total timeout
-- **WHEN** authentication 后的完整处理在 3 秒内未完成
-- **THEN** Gateway 取消剩余工作并返回 HTTP 503 和稳定 classification `directory_timeout`，除非 response 已因 transport disconnect 不可写
+- **WHEN** authentication 成功后的完整处理在 3 秒内未完成
+- **THEN** Gateway 取消剩余工作并返回 HTTP 503 和 code `directory_timeout`，除非 response 已因 transport disconnect 不可写
 
 #### Scenario: Concurrency bulkhead full
 - **WHEN** 已有 2 个 Directory 请求正在执行
-- **THEN** Gateway 不等待、不占用额外数据库连接，并返回 HTTP 429 和稳定 classification `directory_busy`
+- **THEN** Gateway 不等待、不占用额外数据库连接，并返回 HTTP 429 和 code `directory_busy`
+
+#### Scenario: Account limit below byte limit
+- **WHEN** snapshot 包含 10,001 个短字段 Account 且完整编码结果小于 4 MiB
+- **THEN** Gateway 仍因 Account count 独立 hard limit 返回 `directory_account_limit_exceeded`
+
+#### Scenario: Byte limit below Account limit
+- **WHEN** snapshot 不超过 10,000 个 Account 但完整编码结果超过 4 MiB
+- **THEN** Gateway 仍因 response byte 独立 hard limit 返回 `directory_response_limit_exceeded`
+
+#### Scenario: Both count and byte limits remain within bounds
+- **WHEN** snapshot 不超过 10,000 个 Account 且完整编码结果不超过 4 MiB
+- **THEN** Gateway 不因任一容量 limit 拒绝请求，并继续执行其余契约校验
 
 ### Requirement: Per-identity rate limit
-Gateway SHALL 对 `relay_control_reader` 使用每分钟 10 个请求、burst 2 的 non-blocking rate limit。Rate limiter 不可用或无法可靠判定时 SHALL fail-closed，不得绕过限制查询数据库。
+Gateway SHALL 对 HTTP identity `relay_control_reader` 使用 non-blocking token bucket：refill rate 固定为 10 tokens/minute，capacity 固定为 2 tokens，每个请求 cost 固定为 1 token。Rate limiter 不可用或无法可靠判定时 SHALL fail-closed，不得绕过限制查询数据库；该定义不等价于 strict rolling-window “每分钟最多 10 次”。
 
 #### Scenario: Normal polling
 - **WHEN** Control 按 180 秒正常 polling 周期调用 Directory
 - **THEN** 请求在未超过其他 hard limits 时通过 rate admission
 
 #### Scenario: Retry storm
-- **WHEN** reader identity 超过每分钟 10 个请求或瞬时 burst 2
-- **THEN** Gateway 返回 HTTP 429 和稳定 classification `directory_rate_limited`，不执行数据库查询
+- **WHEN** reader identity 的 token bucket 可用 token 少于单请求 cost 1
+- **THEN** Gateway non-blocking 返回 HTTP 429 和 code `directory_rate_limited`，不等待 refill 且不执行数据库查询
+
+#### Scenario: Token bucket refill
+- **WHEN** bucket 未满且时间经过
+- **THEN** Gateway 按 10 tokens/minute 连续 refill，最多恢复到 capacity 2
 
 #### Scenario: Rate decision unavailable
 - **WHEN** rate limiter 无法可靠判定是否可接受请求
 - **THEN** Gateway 返回 HTTP 503 或 429，不把故障当作允许
 
 ### Requirement: Stable failure contract
-所有 non-2xx 响应 SHALL 使用固定、脱敏的 JSON error envelope，至少包含稳定 classification；错误 body MUST NOT 包含 `accounts` 或任何部分 Directory。相同 failure class 的外部语义 SHALL 不依赖底层 SQL、driver 或 runtime 错误文本。
+所有 Directory non-2xx 响应 SHALL 使用固定、脱敏的 JSON error envelope `{"code":"...","message":"..."}`，顶层 SHALL 只允许 string `code` 和 string `message` 两个字段。错误 body MUST NOT 包含 `accounts`、任何部分 Directory、metadata、details、reason、stack 或底层错误文本。相同 error code 的 `message` SHALL 是固定公开文案，不依赖底层 SQL、driver 或 runtime 错误文本。
+
+#### Scenario: Exact error envelope
+- **WHEN** Directory 返回任一 non-2xx response
+- **THEN** JSON 顶层 key set 恰好为 `code` 和 `message`，并同时返回 `Cache-Control: no-store`
 
 #### Scenario: Snapshot integrity failure
 - **WHEN** required scalar 无效、ID 重复、顺序无法保证、序列化失败或完整性校验失败
-- **THEN** Gateway 返回 HTTP 500 和稳定 classification `directory_snapshot_invalid`，不返回部分数据
+- **THEN** Gateway 返回 HTTP 500 和 code `directory_snapshot_invalid`，不返回部分数据
 
 #### Scenario: Database unavailable
 - **WHEN** Directory 专用数据库连接或 projection 不可用且尚未超时
-- **THEN** Gateway 返回 HTTP 503 和稳定 classification `directory_unavailable`
+- **THEN** Gateway 返回 HTTP 503 和 code `directory_unavailable`
 
 ### Requirement: Data-plane priority and independence
 Directory MUST NOT 成为任何 AI request path 的前置或依赖。CPU、内存、数据库连接和 goroutine 使用 SHALL 受专用预算约束；资源竞争、burst、retry storm 或 Control 停止 polling 时，Gateway SHALL 优先失败或 throttle Directory，而不是降低 AI 数据面可用性或改变 Sub2API 原生 routing/scheduling。
