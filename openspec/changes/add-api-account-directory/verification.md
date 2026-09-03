@@ -7,6 +7,8 @@
 - `make test-backend` ✅
 - `make build` ✅
 - `git diff --check` ✅
+- `./dev/devctl down` now succeeds without loading runtime secrets because `DIRECTORY_CURRENT_TOKEN=unused` is supplied to Compose during teardown ✅
+- `./dev/devctl up` / `./dev/devctl check` passed with matching local Control/Gateway images; gateway host port 18081 stayed unreachable and `gateway-proxy` remained healthy ✅
 
 Notes:
 - Directory uses the existing `*sql.DB`; no Migration, DB Role, credential, or dedicated pool was added.
@@ -19,6 +21,7 @@ Notes:
 - Real ingress smoke via `gateway-proxy` verified management TLS + valid token returns Directory JSON with `Cache-Control: no-store`, missing/wrong token returns 401 with the fixed JSON envelope, unsupported method returns 405 with the fixed JSON envelope, and public ingress denies `/internal/v1/*`.
 - The management ACL is rendered from the detected Compose subnet plus `127.0.0.1` for proxy self-healthchecks; the Gateway host port is no longer published on the host.
 - Real shared-stack smoke also ran a live `POST /v1/responses` request through `gateway-proxy`; the AI request completed successfully while Directory stayed bounded by admission control.
+- Management/public ingress behavior remained unchanged after the teardown placeholder fix.
 - Ops deployment docs in `ops/dev/DEPLOYMENT.md` now state the default-disabled Directory, token generation, TLS/ACL, public-ingress deny, and Control credential boundary.
 - `ops/dev/devctl check` ✅ (dev stack healthy).
 - `TestServiceServeRateLimits`, `TestServiceBurstDoesNotBlockUnrelatedRoute`, and `TestServiceServeRejectsBusyRequests` cover the shared-pool/burst admission behavior.
