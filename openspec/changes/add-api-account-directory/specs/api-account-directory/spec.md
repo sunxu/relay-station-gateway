@@ -156,24 +156,28 @@ HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Director
 - **WHEN** caller 尝试通过不受信任网络上的非 TLS transport 访问 Directory
 - **THEN** 部署入口拒绝或不路由该请求，不允许仅凭 token 成功
 
-### Requirement: Least-privilege data access
-Directory SHALL 使用独立 allowlist projection，只读取生成六个公开字段所需的列和经过 4096-byte ceiling 的 `credentials.base_url` scalar。Gateway 专用数据库 runtime role SHALL 为 `relay_directory_db_reader`；SECURITY DEFINER function owner SHALL 为 NOLOGIN `relay_directory_definer`。完整 `credentials`、完整 `extra` 和完整 Account DTO MUST NOT 进入 Directory response pipeline；`relay_directory_db_reader` MUST NOT 获得对 `accounts.credentials` 或其他业务表的通用读取权限。Control MUST NOT 直接连接 Gateway PostgreSQL，也 MUST NOT 获得任一 Gateway database credential。
+### Requirement: Minimal allowlist SQL projection
+Directory SHALL 复用 Gateway 现有数据库连接，并使用独立、单条、只读的 raw SQL allowlist projection。该 statement SHALL 只读取 `id`、`name`、`platform`、`type`、`status` 和经过 string type + 4096-byte ceiling 的 `credentials.base_url` scalar，不得 materialize 完整 `credentials`、完整 `extra`、Account relation 或完整 Account DTO。Gateway 现有 DB identity 本身已有业务权限；最小披露 SHALL 通过 SQL projection、模块依赖隔离和测试保证，不改变数据库 schema、访问身份、credential 或连接配置。Control MUST NOT 直接连接 Gateway PostgreSQL，也 MUST NOT 获得 Gateway database credential。
 
 #### Scenario: Projection execution
 - **WHEN** Gateway 查询 Directory
-- **THEN** 数据访问层只产生 approved scalar projection，不加载 credentials/extra JSON object、Account relations 或 scheduler state
+- **THEN** 数据访问层通过现有数据库连接执行一条只读 raw SQL，并只向应用返回 approved scalar projection，不加载 credentials/extra JSON object、Account relations 或 scheduler state
 
-#### Scenario: Reader database privilege probe
-- **WHEN** 使用 `relay_directory_db_reader` 尝试直接读取 `accounts`、`credentials` 或非批准业务对象
-- **THEN** PostgreSQL 拒绝访问，同时仍允许执行精确 Directory projection
+#### Scenario: No full Account DTO
+- **WHEN** Directory repository 构造或执行查询
+- **THEN** 它不调用完整 Account repository/Ent entity materialization，也不把完整 Account DTO 传给 service 或 handler
 
-#### Scenario: Definer cannot log in
-- **WHEN** caller 尝试以 `relay_directory_definer` 建立数据库连接
-- **THEN** PostgreSQL 拒绝登录，同时该 role 仍可作为 SECURITY DEFINER function owner
+#### Scenario: No full credentials disclosure
+- **WHEN** Account 的 `credentials` 包含 base URL 以外的 API key、token 或任意 canary field
+- **THEN** SQL result、应用对象、成功/失败响应和日志均不包含完整 credentials 或这些非批准字段
+
+#### Scenario: Read-only SQL
+- **WHEN** Directory repository 执行其数据库 statement
+- **THEN** statement 不包含或执行 INSERT、UPDATE、DELETE、MERGE、DDL、SELECT FOR UPDATE、advisory lock 或任何写入/锁定副作用
 
 #### Scenario: Control receives no database credential
 - **WHEN** Ops 为 Control 配置 Directory polling
-- **THEN** Control 只获得 `relay_control_reader` HTTP token 和 management endpoint，不获得 `relay_directory_db_reader` 或 `relay_directory_definer` credential
+- **THEN** Control 只获得 `relay_control_reader` HTTP token 和 management endpoint，不获得 Gateway database credential
 
 ### Requirement: No secret or internal-state disclosure
 成功响应、错误响应、日志和指标 MUST NOT 包含 API Key plaintext、access/refresh/setup token、service token、完整 credentials/extra、proxy credential、raw URL、raw Account/upstream error、SQL、表名、数据库 hostname、stack trace、Group 或 routing relationship、priority、concurrency、schedulable、load、rate-limit/cooldown/overload/breaker、retry policy、scheduler score/state 或 model routing。
@@ -263,11 +267,11 @@ Gateway SHALL 对 HTTP identity `relay_control_reader` 使用 non-blocking token
 - **THEN** Gateway 返回 HTTP 500 和 code `directory_snapshot_invalid`，不返回部分数据
 
 #### Scenario: Database unavailable
-- **WHEN** Directory 专用数据库连接或 projection 不可用且尚未超时
+- **WHEN** Gateway 现有数据库连接或 Directory projection 不可用且尚未超时
 - **THEN** Gateway 返回 HTTP 503 和 code `directory_unavailable`
 
 ### Requirement: Data-plane priority and independence
-Directory MUST NOT 成为任何 AI request path 的前置或依赖。CPU、内存、数据库连接和 goroutine 使用 SHALL 受专用预算约束；资源竞争、burst、retry storm 或 Control 停止 polling 时，Gateway SHALL 优先失败或 throttle Directory，而不是降低 AI 数据面可用性或改变 Sub2API 原生 routing/scheduling。
+Directory MUST NOT 成为任何 AI request path 的前置或依赖。Directory 额外占用的 CPU、内存、数据库连接和 goroutine 开销 SHALL 保持严格有界；资源竞争、burst、retry storm 或 Control 停止 polling 时，Gateway SHALL 优先失败或 throttle Directory，而不是降低 AI 数据面可用性或改变 Sub2API 原生 routing/scheduling。
 
 #### Scenario: Directory failure during AI traffic
 - **WHEN** Directory 数据库、鉴权、限流或 handler 持续失败，同时 AI 请求进入 Gateway
@@ -275,7 +279,7 @@ Directory MUST NOT 成为任何 AI request path 的前置或依赖。CPU、内�
 
 #### Scenario: Resource pressure
 - **WHEN** Gateway 处于数据库连接或 CPU 压力且 Directory 请求到达
-- **THEN** Directory 受 bulkhead、timeout 或限流拒绝，不能耗尽为数据面保留的资源
+- **THEN** Directory 受 bulkhead、timeout 或限流拒绝，且不会申请额外 DB pool、connection config，也不会创建仅供 Directory 使用的连接隔离层
 
 #### Scenario: Control stops polling
 - **WHEN** Control 长时间不再请求 Directory
