@@ -3,6 +3,7 @@ package config
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -75,6 +76,7 @@ type Config struct {
 	Database                DatabaseConfig                `mapstructure:"database"`
 	Redis                   RedisConfig                   `mapstructure:"redis"`
 	Ops                     OpsConfig                     `mapstructure:"ops"`
+	Directory               DirectoryConfig               `mapstructure:"directory"`
 	JWT                     JWTConfig                     `mapstructure:"jwt"`
 	Totp                    TotpConfig                    `mapstructure:"totp"`
 	WebAuthn                WebAuthnConfig                `mapstructure:"webauthn"`
@@ -106,6 +108,13 @@ type Config struct {
 	Plugins                 PluginConfig                  `mapstructure:"plugins"`
 }
 
+type DirectoryConfig struct {
+	Enabled               bool   `mapstructure:"enabled"`
+	CurrentToken          string `mapstructure:"current_token" json:"-" yaml:"-"`
+	PreviousToken         string `mapstructure:"previous_token" json:"-" yaml:"-"`
+	RotationWindowSeconds int    `mapstructure:"rotation_window_seconds"`
+}
+
 // PluginConfig 控制管理员手动上传的本地进程插件。
 // 默认不包含插件，也不允许安装未签名插件；TrustedPublishers 用于追加第三方发布者。
 type PluginConfig struct {
@@ -115,6 +124,42 @@ type PluginConfig struct {
 	MaxUploadBytes       int64             `mapstructure:"max_upload_bytes"`
 	MaxUncompressedBytes int64             `mapstructure:"max_uncompressed_bytes"`
 	StartTimeoutSeconds  int               `mapstructure:"start_timeout_seconds"`
+}
+
+func (d *DirectoryConfig) Validate() error {
+	if d == nil || !d.Enabled {
+		return nil
+	}
+	if d.RotationWindowSeconds < 0 {
+		return fmt.Errorf("directory.rotation_window_seconds must be non-negative")
+	}
+	currentToken := strings.TrimSpace(d.CurrentToken)
+	if currentToken == "" {
+		return fmt.Errorf("directory.current_token is required when directory.enabled=true")
+	}
+	if _, err := decodeDirectoryTokenConfig(currentToken); err != nil {
+		return fmt.Errorf("directory.current_token: %w", err)
+	}
+	if strings.TrimSpace(d.PreviousToken) != "" {
+		if d.RotationWindowSeconds <= 0 {
+			return fmt.Errorf("directory.rotation_window_seconds must be positive when directory.previous_token is configured")
+		}
+		if _, err := decodeDirectoryTokenConfig(d.PreviousToken); err != nil {
+			return fmt.Errorf("directory.previous_token: %w", err)
+		}
+	}
+	return nil
+}
+
+func decodeDirectoryTokenConfig(raw string) ([]byte, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) < 32 {
+		return nil, fmt.Errorf("decoded token must be at least 32 bytes")
+	}
+	return decoded, nil
 }
 
 type LogConfig struct {
@@ -1891,6 +1936,8 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	cfg.Log.StacktraceLevel = strings.ToLower(strings.TrimSpace(cfg.Log.StacktraceLevel))
 	cfg.Log.Output.FilePath = strings.TrimSpace(cfg.Log.Output.FilePath)
 	cfg.Gateway.ForcedCodexInstructionsTemplateFile = strings.TrimSpace(cfg.Gateway.ForcedCodexInstructionsTemplateFile)
+	cfg.Directory.CurrentToken = strings.TrimSpace(cfg.Directory.CurrentToken)
+	cfg.Directory.PreviousToken = strings.TrimSpace(cfg.Directory.PreviousToken)
 	if cfg.Gateway.ForcedCodexInstructionsTemplateFile != "" {
 		content, err := os.ReadFile(cfg.Gateway.ForcedCodexInstructionsTemplateFile)
 		if err != nil {
@@ -2254,6 +2301,12 @@ func setDefaults() {
 	viper.SetDefault("ops.metrics_collector_cache.enabled", true)
 	// TTL should be slightly larger than collection interval (1m) to maximize cross-replica cache hits.
 	viper.SetDefault("ops.metrics_collector_cache.ttl", 65*time.Second)
+
+	// Directory
+	viper.SetDefault("directory.enabled", false)
+	viper.SetDefault("directory.current_token", "")
+	viper.SetDefault("directory.previous_token", "")
+	viper.SetDefault("directory.rotation_window_seconds", 0)
 
 	// JWT
 	viper.SetDefault("jwt.secret", "")
@@ -2712,6 +2765,9 @@ func (c *Config) Validate() error {
 	// 选择 bytes 而不是 rune 计数，确保二进制/随机串的长度语义更接近“熵”而非“字符数”。
 	if len([]byte(jwtSecret)) < 32 {
 		return fmt.Errorf("jwt.secret must be at least 32 bytes")
+	}
+	if err := c.Directory.Validate(); err != nil {
+		return err
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":

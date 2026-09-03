@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func resetViperWithJWTSecret(t *testing.T) {
@@ -28,6 +30,25 @@ func TestLoadDefaultModelsListReadMaxBytes(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, DefaultModelsListReadMaxBytes, cfg.Gateway.ModelsListReadMaxBytes)
+}
+
+func TestDirectoryConfigSerializationOmitsTokens(t *testing.T) {
+	cfg := DirectoryConfig{
+		Enabled:               true,
+		CurrentToken:          "current",
+		PreviousToken:         "previous",
+		RotationWindowSeconds: 60,
+	}
+
+	jsonBytes, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	require.NotContains(t, string(jsonBytes), "current")
+	require.NotContains(t, string(jsonBytes), "previous")
+
+	yamlBytes, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	require.NotContains(t, string(yamlBytes), "current")
+	require.NotContains(t, string(yamlBytes), "previous")
 }
 
 func TestLoadTimezonePrecedence(t *testing.T) {
