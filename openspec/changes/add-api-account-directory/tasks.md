@@ -26,7 +26,7 @@
 - [x] 4.2 实现有界 URL scalar 的 origin-only sanitizer，覆盖 HTTP(S)、显式 port、IPv6、userinfo、path、query、fragment、非法 scheme 和 malformed URL
 - [x] 4.3 实现 projection row/whole-snapshot 校验，拒绝非法 required scalar、非正数、重复、非递增 ID，同时让 malformed URL 降级 null、未知 platform/status string 原样保留
 - [x] 4.4 实现 JSON integer `schema_version=1`、UTC RFC 3339 `generated_at` 和精确 item DTO，并验证 string `"1"`、wrapper 和额外字段被拒绝
-- [ ] 4.5 使用 credentials/raw URL/SQL/DB error canary 验证 result、成功/失败 body、日志和指标均无泄漏
+- [x] 4.5 使用 credentials/raw URL/SQL/DB error canary 验证 result、成功/失败 body、日志无泄漏；Directory 不产出独立指标时记为 N/A
 
 ## 5. 实现准入、完整响应与有界资源占用
 
@@ -35,14 +35,14 @@
 - [x] 5.3 在 authentication 成功后立即启动 3 秒 total deadline，将 DB deadline 设为 `min(queryStart+2s,totalDeadline)`，并验证连接等待、查询和编码均受预算约束
 - [x] 5.4 实现独立 10,000 Account ceiling 和 4 MiB bounded encode-before-write，并用独立/交叉边界测试验证 whole-request failure
 - [x] 5.5 实现仅含 `code`、`message` 的稳定 error mapping 和所有路径 `Cache-Control: no-store`
-- [ ] 5.6 在共享 DB pool 压力与 retry storm 下验证 Directory 受 admission/timeout 限制、额外资源占用有界，AI request 不等待 Directory-specific state/lock，且没有 scheduler/account mutation
+- [x] 5.6 在共享 DB pool 压力与 retry storm 下验证 Directory 受 admission/timeout 限制、额外资源占用有界，AI request 不等待 Directory-specific state/lock，且没有 scheduler/account mutation
 
 ## 6. 注册 route 与部署边界
 
 - [x] 6.1 让 `GET /internal/v1/api-account-directory` 走 Directory handler，并让其他 method 在同一路径返回固定错误 envelope
 - [x] 6.2 将 Directory 接入现有 composition/lifecycle，验证 disabled 模式不执行查询且没有独立数据库资源需要创建或关闭
-- [ ] 6.3 更新 Gateway config hooks 与 Ops 部署文档，明确 Gateway 负责 route/auth/default-disabled，Ops 负责 CSPRNG token、TLS、management ACL、public-ingress deny 和 Secret deployment
-- [ ] 6.4 执行 ingress smoke test，验证 public AI ingress 拒绝 `/internal/v1/*`，management ingress 同时要求 TLS、ACL 和 service auth，Control 配置不含 Gateway DB credential
+- [x] 6.3 更新 Gateway config hooks 与 Ops 部署文档，明确 Gateway 负责 route/auth/default-disabled，Ops 负责 CSPRNG token、TLS、management ACL、public-ingress deny 和 Secret deployment
+- [x] 6.4 执行 ingress smoke test，验证 public AI ingress 拒绝 `/internal/v1/*`，management ingress 同时要求 TLS、ACL 和 service auth，Control 配置不含 Gateway DB credential
 
 ## 7. 完成验收与证据
 
