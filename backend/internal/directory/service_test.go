@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +33,19 @@ func (r *fakeRepo) List(ctx context.Context) ([]Row, error) {
 		}
 	}
 	return r.rows, r.err
+}
+
+type blockingRepo struct {
+	started chan struct{}
+}
+
+func (r *blockingRepo) List(ctx context.Context) ([]Row, error) {
+	select {
+	case r.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func TestServiceServeSuccess(t *testing.T) {
@@ -102,6 +117,37 @@ func TestServiceServeRejectsMalformedToken(t *testing.T) {
 	w := performRequest(t, svc, "Bearer invalid!token")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 	require.JSONEq(t, `{"code":"directory_unauthorized","message":"Authorization header is required"}`, w.Body.String())
+}
+
+func TestServiceServeRedactsSecretCanaries(t *testing.T) {
+	const (
+		urlCanary   = "canary-url-1f0f6a7e"
+		errCanary   = "canary-db-error-2b9a8d0c"
+		tokenCanary = "canary-token-4f3e1d2c"
+	)
+
+	successSvc := newTestService(t, &fakeRepo{rows: []Row{{
+		GeneratedAt: time.Now().UTC(),
+		ID:          ptr[int64](1),
+		Name:        ptr("n"),
+		Platform:    ptr("openai"),
+		Type:        ptr("apikey"),
+		URLSource:   ptr(urlCanary),
+		Status:      ptr("active"),
+	}}})
+	success := performRequest(t, successSvc, validAuthHeader())
+	require.Equal(t, http.StatusOK, success.Code)
+	require.NotContains(t, success.Body.String(), urlCanary)
+
+	errorSvc := newTestService(t, &fakeRepo{err: errors.New(errCanary)})
+	failure := performRequest(t, errorSvc, validAuthHeader())
+	require.Equal(t, http.StatusServiceUnavailable, failure.Code)
+	require.NotContains(t, failure.Body.String(), errCanary)
+
+	authSvc := newTestService(t, &fakeRepo{})
+	auth := performRequest(t, authSvc, "Bearer "+tokenCanary)
+	require.Equal(t, http.StatusUnauthorized, auth.Code)
+	require.NotContains(t, auth.Body.String(), tokenCanary)
 }
 
 func TestAuthorizationHeaderLengthLimit(t *testing.T) {
@@ -201,6 +247,57 @@ func TestTokenBucketRefill(t *testing.T) {
 	require.True(t, bucket.Allow(t0.Add(24*time.Second)))
 	require.True(t, bucket.Allow(t0.Add(24*time.Second)))
 	require.False(t, bucket.Allow(t0.Add(24*time.Second)))
+}
+
+func TestServiceBurstDoesNotBlockUnrelatedRoute(t *testing.T) {
+	repo := &blockingRepo{started: make(chan struct{}, 2)}
+	svc := newTestService(t, repo)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Any("/internal/v1/api-account-directory", NewHandler(svc).Get)
+	router.GET("/v1/chat/completions", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	var wg sync.WaitGroup
+	errCh := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/internal/v1/api-account-directory", nil)
+			req.Header.Set("Authorization", validAuthHeader())
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			errCh <- w
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-repo.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected directory request to start")
+		}
+	}
+
+	aiReq := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	aiResp := httptest.NewRecorder()
+	router.ServeHTTP(aiResp, aiReq)
+	require.Equal(t, http.StatusOK, aiResp.Code)
+	require.JSONEq(t, `{"ok":true}`, aiResp.Body.String())
+
+	busyReq := httptest.NewRequest(http.MethodGet, "/internal/v1/api-account-directory", nil)
+	busyReq.Header.Set("Authorization", validAuthHeader())
+	busyResp := httptest.NewRecorder()
+	router.ServeHTTP(busyResp, busyReq)
+	require.Equal(t, http.StatusTooManyRequests, busyResp.Code)
+
+	wg.Wait()
+	close(errCh)
+	for resp := range errCh {
+		require.Equal(t, http.StatusServiceUnavailable, resp.Code)
+		require.Contains(t, resp.Body.String(), "directory_query_timeout")
+	}
 }
 
 func TestServiceServeRejectsBusyRequests(t *testing.T) {
