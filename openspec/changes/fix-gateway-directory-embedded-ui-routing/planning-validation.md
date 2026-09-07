@@ -14,7 +14,7 @@
 | V4 | SPA 与既有 backend namespace 回归 | embed/router 测试覆盖 SPA、`/api/`、`/v1/`、`/v1beta/`、`/backend-api/`、`/antigravity/`、`/setup/`、health/model/response/media | PASS：对应实施/本地验收证据见下 |
 | V5 | source v1、limits、完整性、排序、redaction、safe URL、数据面隔离 | 既有 Directory 测试与本 change 回归命令 | PASS：对应实施/本地验收证据见下 |
 | V6 | TLS、管理网、public ingress 与 neighboring internal route 安全负向 | 受限网络/认证集成验证 | PASS：对应实施/本地验收证据见下 |
-| V7 | hard limits、超时、速率、并发和性能隔离 | Gateway 专项与联合压测/资源隔离验证 | PASS：对应实施/本地验收证据见下 |
+| V7 | hard limits、超时、速率、并发和性能隔离 | Gateway 专项与联合压测/资源隔离验证 | 部分完成：limits/timeout/admission 专项及基本数据面可用性已验证；完整性能隔离仍待补证，见 Final Review |
 | V8 | 镜像与回滚 | 对应 revision 镜像已构建、部署并 smoke；回滚准备为受保护 DB/config 备份与旧镜像 | 部署 PASS；未执行旧镜像回滚，不声称回滚演练通过 |
 | V9 | 规划工件严格校验和范围 | `openspec validate fix-gateway-directory-embedded-ui-routing --type change --strict --no-interactive`、`git diff --check`、工作树检查 | PASS：change strict；all strict 3/3；diff check；仅新增本 change |
 
@@ -81,4 +81,12 @@
 
 收尾：Gateway 保持修复镜像 healthy；Gateway Directory 与 Control Directory 均恢复/保持 false。Node 账号文件仍 6 个。Control/ops 工作树干净且未修改；Control change 仍为 22/27，后续联合 ingestion/Binding 验收须在其自身 change 继续，不自动关闭。
 
-最终验证：change strict PASS、all strict 3/3 PASS、`git diff --check` PASS。最终提交只含 tasks 与本验收文档；提交后复核工作树。全部 13 项完成，等待 implementation/release review；未 archive 或 push。
+最终验证：change strict PASS、all strict 3/3 PASS、`git diff --check` PASS。最终提交只含 tasks 与本验收文档；提交后复核工作树。当时标记 13 项完成；后续 Final Review 重新打开 4.4，当前 12/13。未 archive 或 push。
+
+## Final Review
+
+REQUEST CHANGES，P1=0、P2=1。双入口真实 handler/router、HTTP 契约、命名空间边界与部署 smoke 充分；未发现生产路由修复缺陷。
+
+P2：此前 V7 整体 PASS、4.4 完成状态超出了实际证据。一次 baseline/一次 burst 下 AI 成功、限流有界，以及生产 diff 未改变调度实现，不能单独证明压力下所有原生 scheduler/retry/breaker/affinity/drain 行为与性能隔离要求。现有延迟样本仅为观测，不是统计对照实验。
+
+4.4 重新打开，当前 12/13；V7 改为部分完成。已有测试及部署结果保留，不放宽测试断言、不修改生产实现、不宣称新增实测。补齐 4.4 的明确压力条件、可复用原生行为断言与对照结果后才能关闭；若要收窄原验收范围，须显式评审该调整，不能在 evidence 中静默豁免。Control 联合验收暂未继续，仍 22/27。
