@@ -14,7 +14,7 @@
 | V4 | SPA 与既有 backend namespace 回归 | embed/router 测试覆盖 SPA、`/api/`、`/v1/`、`/v1beta/`、`/backend-api/`、`/antigravity/`、`/setup/`、health/model/response/media | PASS：对应实施/本地验收证据见下 |
 | V5 | source v1、limits、完整性、排序、redaction、safe URL、数据面隔离 | 既有 Directory 测试与本 change 回归命令 | PASS：对应实施/本地验收证据见下 |
 | V6 | TLS、管理网、public ingress 与 neighboring internal route 安全负向 | 受限网络/认证集成验证 | PASS：对应实施/本地验收证据见下 |
-| V7 | hard limits、超时、速率、并发和性能隔离 | Gateway 专项与联合压测/资源隔离验证 | 部分完成：limits/timeout/admission 专项及基本数据面可用性已验证；完整性能隔离仍待补证，见 Final Review |
+| V7 | hard limits、超时、速率、并发和性能隔离 | Gateway 专项与联合压测/资源隔离验证 | PASS：既有边界专项、本地部署及新增确定性占槽/原生行为对照，见补证与复核；非数据库容量/SLO基准 |
 | V8 | 镜像与回滚 | 对应 revision 镜像已构建、部署并 smoke；回滚准备为受保护 DB/config 备份与旧镜像 | 部署 PASS；未执行旧镜像回滚，不声称回滚演练通过 |
 | V9 | 规划工件严格校验和范围 | `openspec validate fix-gateway-directory-embedded-ui-routing --type change --strict --no-interactive`、`git diff --check`、工作树检查 | PASS：change strict；all strict 3/3；diff check；仅新增本 change |
 
@@ -90,3 +90,29 @@ REQUEST CHANGES，P1=0、P2=1。双入口真实 handler/router、HTTP 契约、�
 P2：此前 V7 整体 PASS、4.4 完成状态超出了实际证据。一次 baseline/一次 burst 下 AI 成功、限流有界，以及生产 diff 未改变调度实现，不能单独证明压力下所有原生 scheduler/retry/breaker/affinity/drain 行为与性能隔离要求。现有延迟样本仅为观测，不是统计对照实验。
 
 4.4 重新打开，当前 12/13；V7 改为部分完成。已有测试及部署结果保留，不放宽测试断言、不修改生产实现、不宣称新增实测。补齐 4.4 的明确压力条件、可复用原生行为断言与对照结果后才能关闭；若要收窄原验收范围，须显式评审该调整，不能在 evidence 中静默豁免。Control 联合验收暂未继续，仍 22/27。
+
+## Deterministic isolation acceptance
+
+新增仅测试文件，无生产实现、账号配置或 migration 改动：
+
+| 证据 | fixture / assertion | 结果 |
+| --- | --- | --- |
+| `backend/internal/handler/directory_pressure_isolation_test.go` / `TestDirectoryPressurePreservesNativeAIRequest` | 复用真实 `OpenAIGatewayHandler` / `OpenAIGatewayService`，与 Directory 共用 router；有效账号、受控 upstream 的 healthy / first_429 两种序列，各三轮 baseline/压力对照。AI 请求前已占满两个 Directory 查询并收到两个 429；AI 结束后两个查询仍 active、未产生 Directory 成功响应。正常访问序列精确为 `[801]`，首个429重试精确为 `[801,802]`，两组一致；AI HTTP200。释放后严格2×200+2×429，JSON/no-store、固定code、精确numeric ID、repository调用数2 | 三轮专项 PASS |
+| `backend/internal/service/directory_load_isolation_test.go` / `TestDirectoryBurstPreservesNativeGatewayBehavior` | 原生priority/sticky/429 retry/breaker默认及persisted-runtime触发/跨scheduler guardian affinity/client-disconnect usage drain各执行baseline与同进程Directory占槽对照。明确先收到第三请求429，原生断言结束后active仍2，repo调用数2；取消并等待清理 | 三轮专项 PASS |
+
+从 `backend/` 执行：`go test -tags=unit ./internal/handler ./internal/service -run '^TestDirectory(PressurePreservesNativeAIRequest|BurstPreservesNativeGatewayBehavior)$' -count=3 -v`，exit 0，handler 1.572s、service 2.511s，无 SKIP。handler 内部每种模式三轮，外部 count=3，因此共18对baseline/压力请求序列；service共7种原生行为×两种条件×3轮。
+
+这次补证采用事件顺序和原生行为断言，未把单次外部推理延迟或简单200当成全部隔离证明。数据源与账号仓储是fixture，upstream为确定性stub；不声称共享PostgreSQL连接池压力或外部模型容量/SLO已测。客户端usage drain与调度drain区分如design所述；没有新增后者。
+
+验证中发现并修正了测试夹具问题：提前读取的429响应必须保留计入最终计数；healthy必须使用有效凭据，不能意外触发凭据回退；所有失败路径均释放/取消Directory并等待goroutine。严格响应数量、账号序列和active断言保留。
+
+### Re-review result
+
+P2 已补证关闭，P1=0、P2=0。独立 review_inventory 只读复核确认：真实 AI handler/service 与 Directory 共用 router，baseline/压力组的账号访问序列精确一致；原生策略测试在两个 Directory 查询持续占用期间运行；断言和清理不会把提前释放压力当作成功。4.4 恢复完成，当前13/13。
+
+并发夹具额外检查：首次合并 `go test -race` 因8GiB DevRAM空间不足在compile/link阶段失败，未运行成功，未视作测试PASS。临时目录由Go退出自动释放后，保持默认GOCACHE/GOTMPDIR，不删除缓存，改为单包串行：
+
+- `go test -race -p=1 -tags=unit ./internal/handler -run '^TestDirectoryPressurePreservesNativeAIRequest$' -count=1`：PASS，2.450s。
+- `go test -race -p=1 -tags=unit ./internal/service -run '^TestDirectoryBurstPreservesNativeGatewayBehavior$' -count=1`：PASS，2.674s。
+
+两项race最终均exit0，没有race报告。补证只新增两个测试文件并更新本change的design/tasks/evidence；未修改生产代码、API、runtime配置、账号或migration，未重建/重部署镜像。此前部署的`dfe441923`生产实现保持不变。Control仍22/27，尚未执行新的联合验收。

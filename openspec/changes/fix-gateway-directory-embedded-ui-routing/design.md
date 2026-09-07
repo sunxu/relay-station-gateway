@@ -37,3 +37,13 @@
 2. 运行 Gateway 相关单元、route、embed 和集成测试，确认既有 Directory spec 的 auth/limits/data-plane 测试未回归。
 3. 构建带当前 revision 的 Gateway 镜像；在受控联合验收中将 `DIRECTORY_ENABLED` 设为启用以验证成功路径，并单独验证 disabled 负向路径，reader token、TLS 和 ingress ACL 保持不变，验收后恢复约定的配置状态。
 4. 回滚时停止使用修复镜像并恢复上一兼容镜像；无 migration、volume 或 runtime secret 变更。
+
+## Validation
+
+4.4 以可重复的资源占用与行为对照补证，而非用外部模型两次延迟推断隔离：
+
+- 共享 Gin router 注册真实 Directory service 与原生 AI handler/service；受控 upstream 固定正常/首次 429 的响应序列，baseline 和压力组使用相同有效账号 fixture。每组重复三轮。
+- 压力组先确认两个 Directory 查询正在阻塞，再确认溢出请求返回 429；AI 返回后这两个查询仍须 active，尚未释放且没有 Directory 成功响应。由此验证 AI 不等待 Directory 槽释放，1s 超时仅作为失败保护，不定义新的生产延迟 SLO。
+- 对比 AI HTTP 成功、精确 upstream 账号访问序列；释放 Directory 后严格为两个完整 200 与两个固定分类 429，repository 调用数为 2。
+- 对 routing/scheduler 优先级、sticky、429 retry、breaker 默认与触发状态、guardian affinity、客户端断开后的 usage drain，复用现有原生测试断言，分别执行 baseline 与两个 Directory 槽持续占用时的同进程对照。这里的 drain 指真实存在的响应读取行为，不引入 Relay/Gateway 调度 drain 能力。
+- 数据源与原生账号仓储使用隔离 fixture，不连接或修改真实账号；测试不声称验证共享 PostgreSQL 池饱和、容量上限或外部模型 P95/P99。结合已有真实部署 burst/入口验收，证明本次路由修复的 admission、非阻塞性与原生行为保持。
