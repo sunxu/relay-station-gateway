@@ -519,6 +519,7 @@ func TestFrontendServer_Middleware(t *testing.T) {
 		require.NoError(t, err)
 
 		apiPaths := []string{
+			"/internal/v1/api-account-directory",
 			"/api/v1/users",
 			"/models",
 			"/v1/models",
@@ -650,11 +651,11 @@ func TestFrontendServer_Middleware(t *testing.T) {
 
 		// Request for existing static file
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/logo.png", nil)
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Header().Get("Content-Type"), "image/png")
+		assert.Contains(t, w.Header().Get("Content-Type"), "image/svg+xml")
 		assert.Empty(t, w.Header().Get("Cache-Control"))
 
 		entries, err := fs.ReadDir(server.distFS, "assets")
@@ -676,6 +677,7 @@ func TestFrontendServer_Middleware(t *testing.T) {
 		assert.Equal(t, http.StatusOK, assetWriter.Code)
 		assert.Equal(t, staticAssetsCacheControl, assetWriter.Header().Get("Cache-Control"))
 	})
+
 }
 
 func TestEmbeddedFrontendBypassesBareVideoAPIRoutes(t *testing.T) {
@@ -735,11 +737,11 @@ func TestServeEmbeddedFrontend(t *testing.T) {
 		router.Use(middleware)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/logo.png", nil)
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Header().Get("Content-Type"), "image/png")
+		assert.Contains(t, w.Header().Get("Content-Type"), "image/svg+xml")
 	})
 
 	t.Run("serves_index_html_for_root", func(t *testing.T) {
@@ -907,5 +909,14 @@ func BenchmarkFrontendServerServeIndexHTML(b *testing.B) {
 		c.Set(middleware.CSPNonceKey, "test-nonce")
 
 		server.serveIndexHTML(c)
+	}
+}
+
+func TestEmbeddedFrontendInternalNamespaceBoundary(t *testing.T) {
+	for _, path := range []string{"/internal/", "/internal/v1/api-account-directory", "/internal/unknown"} {
+		require.True(t, shouldBypassEmbeddedFrontend(path), "path=%s", path)
+	}
+	for _, path := range []string{"/internal", "/internal-ui/dashboard", "/internalized/page"} {
+		require.False(t, shouldBypassEmbeddedFrontend(path), "path=%s", path)
 	}
 }

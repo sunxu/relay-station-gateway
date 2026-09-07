@@ -38,3 +38,14 @@
 专项计划命令（从 `backend/`）：`go test -tags=embed ./internal/web ./internal/server/routes -count=1 -v`。若集成夹具位于其它包，实施时一并记录实际包与命令。验收证据必须含两个入口对应测试名称、PASS 且无 SKIP；无 embed tag、无测试匹配或缺少嵌入资源不算通过。此命令本轮未执行。
 
 2026-09-07 设计评审 P2 修订：补齐两入口矩阵、真实 route/handler 要求及 embed tag 执行约束。仅修规划文档，实施任务保持未完成。
+
+## Implementation evidence
+
+2026-09-07：生产改动仅为 `backend/internal/web/embed_on.go` 的共享 predicate 增加 `/internal/`。`backend/internal/server/routes/directory_embed_test.go` 使用真实 route、service 与两个真实 frontend middleware；数据源使用固定只读 fixture。
+
+- Red：临时移除该行，执行 `go test -tags=embed ./internal/server/routes -run '^TestEmbeddedDirectoryRouteMatrixBothFrontendEntrypoints$' -count=1`，settings/legacy 均因 `text/html` 而失败。恢复修复后执行下列完整专项。
+- Green：从 `backend/` 执行 `go test -tags=embed ./internal/web ./internal/server/routes -count=1 -v`，PASS（web 0.788s，routes 2.606s），无 SKIP。`TestEmbeddedDirectoryRouteMatrixBothFrontendEntrypoints/settings` 与 `/legacy` 均 PASS；覆盖上述两入口矩阵。错误响应断言固定 JSON 与 no-store；四个边界 ID 以 `json.RawMessage` 逐字断言 source v1 numeric JSON，未经过 float64。
+- `TestEmbeddedFrontendInternalNamespaceBoundary`：`/internal/` 及其子路径 bypass；`/internal`、`/internal-ui/`、`/internalized/` 不扩大匹配，PASS。
+- 静态文件测试修正为当前真实 `dist/logo.svg`，保留 SVG MIME 与 cache header 断言；原 `/logo.png` 已不存在，未新增或修改前端资源。
+- `go test ./internal/directory ./internal/config -count=1`：PASS（3.779s / 3.244s）。复用既有完整性、safe URL、redaction、timeout、rate、bulkhead、unrelated-route isolation 测试；这不是实际部署性能证明。
+- 尚待实际镜像、入口 ACL 与共享数据面联合验收；未改变 TLS、认证、API、migration、Control 或 Ops 实现。
