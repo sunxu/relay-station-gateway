@@ -143,7 +143,7 @@ Directory SHALL 只接受独立 `relay_control_reader` service token。Ops SHALL
 - **THEN** previous token 与 current token 使用相同 unpadded Base64URL decode、至少 32 decoded bytes 和 constant-time comparison 规则
 
 ### Requirement: Exact authorization and management-network isolation
-HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Directory route。Gateway SHALL 负责 route、authentication、config hooks 和 default-disabled 行为；Ops SHALL 负责生产 TLS、restricted management network ACL、public-ingress deny 和 HTTP/DB Secret deployment。任一边界 MUST NOT 替代另一个，部署前置条件未满足时 Directory MUST 保持 disabled，且 MUST NOT 通过 public AI ingress 暴露。
+HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Directory route。由 Control 管理的 Gateway Directory endpoint SHALL 在每个环境使用 HTTP-only transport (`http://`)；本 requirement 不约束 Gateway 到 Relay Node 的 AI endpoint、Sub2API generic Account/upstream URL、Gateway generic HTTP client 或任何外部 upstream。Gateway SHALL 负责 route、authentication、config hooks 和 default-disabled 行为；Ops SHALL 负责 restricted management network ACL、public-ingress deny 和 HTTP/DB Secret deployment。内部 HTTP 不提供对 east-west 流量窃听者的机密性保护，token 机密性依赖网络隔离；TLS、证书、CA 和 mTLS 不属于该 Directory transport contract。任一边界 MUST NOT 替代另一个，部署前置条件未满足时 Directory MUST 保持 disabled，且 MUST NOT 通过 public AI ingress 暴露。
 
 #### Scenario: Neighboring internal route
 - **WHEN** 已认证 reader identity 请求其他 internal、admin、Account、Group、API-key 或 credential route
@@ -153,9 +153,20 @@ HTTP identity `relay_control_reader` SHALL 只被授权访问精确 GET Director
 - **WHEN** 请求携带有效 reader token但来自 public AI ingress 或不满足 management network policy
 - **THEN** 请求在到达 Directory handler 前被拒绝
 
-#### Scenario: Plaintext transport
-- **WHEN** caller 尝试通过不受信任网络上的非 TLS transport 访问 Directory
-- **THEN** 部署入口拒绝或不路由该请求，不允许仅凭 token 成功
+#### Scenario: Restricted internal HTTP transport
+- **WHEN** 已授权 caller 通过 restricted/private management network 使用 `http://` 访问 Directory
+- **THEN** Gateway 返回 Directory response；service token、private-network isolation 和 exact route authorization 均保持有效
+
+#### Scenario: Public ingress isolation without TLS dependency
+- **WHEN** caller 尝试通过 public AI ingress 访问 `/internal/v1/api-account-directory`，即使携带有效 reader token
+- **THEN** public ingress 在到达 Directory handler 前拒绝或不路由该请求；取消内部 TLS 不得开放该 route
+
+### Requirement: Gateway data-plane upstream transport is unaffected
+Gateway Account、Sub2API generic upstream URL 和 Gateway 到 Relay Node 的 AI endpoint transport SHALL 继续完全由 Sub2API 原生行为约束；本 Directory change MUST NOT reject、rewrite、classify 或 otherwise alter 其 HTTP/HTTPS scheme。
+
+#### Scenario: Gateway upstream scheme remains native
+- **WHEN** Gateway Account 或 upstream 使用 Sub2API 支持的 transport scheme
+- **THEN** 本 change 不因 Relay Station topology 或 Directory transport policy 拒绝、重写或改变该 endpoint，且不修改 Gateway data-plane routing/scheduling
 
 ### Requirement: Minimal allowlist SQL projection
 Directory SHALL 复用 Gateway 现有数据库连接，并使用独立、单条、只读的 raw SQL allowlist projection。该 statement SHALL 只读取 `id`、`name`、`platform`、`type`、`status` 和经过 string type + 4096-byte ceiling 的 `credentials.base_url` scalar，不得 materialize 完整 `credentials`、完整 `extra`、Account relation 或完整 Account DTO。Gateway 现有 DB identity 本身已有业务权限；最小披露 SHALL 通过 SQL projection、模块依赖隔离和测试保证，不改变数据库 schema、访问身份、credential 或连接配置。Control MUST NOT 直接连接 Gateway PostgreSQL，也 MUST NOT 获得 Gateway database credential。
